@@ -1,0 +1,39 @@
+{
+  "name": "gemini-antigravity-chrome",
+  "version": "2.1.0",
+  "description": "34-tool local Model Context Protocol (MCP) Chrome extension & CDP 1.3 browser automation bridge for Google Antigravity IDE (v2.33+) & Gemini CLI.",
+  "license": "MIT",
+  "author": "VionixAI <https://vionixai.tech/>",
+  "homepage": "https://extensions.vionixai.tech/gemini-antigravity/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yusufchy/gemini-antigravity-chrome.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Yusufchy/gemini-antigravity-chrome/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "chrome-extension",
+    "browser-automation",
+    "chrome-devtools-protocol",
+    "playwright",
+    "core-web-vitals",
+    "wcag",
+    "ai-agent",
+    "vionixai"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "bin": {
+    "antigravity-chrome": "./bridge/mcp-server.js"
+  },
+  "scripts": {
+    "install-bridge": "node scripts/install.js",
+    "uninstall-bridge": "node scripts/uninstall.js",
+    "build-cws": "node scripts/build-cws-package.js",
+    "test-bridge": "node scripts/test-bridge.js"
+  }
+}

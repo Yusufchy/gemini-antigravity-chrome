@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>Antigravity</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <img src="../icons/icon-32.png" alt="Antigravity" class="brand-icon" width="22" height="22">
+      <div>
+        <h1>Antigravity</h1>
+        <p class="subtitle">Browser Control v2.0</p>
+      </div>
+    </div>
+    <span id="status-badge" class="badge">Checking</span>
+  </header>
+
+  <section class="card">
+    <div class="row">
+      <span class="label">Antigravity Host</span>
+      <span id="agy-version" class="value">Checking...</span>
+    </div>
+    <div class="row">
+      <span class="label">Bridge</span>
+      <code id="bridge-endpoint" class="code-pill">127.0.0.1:17380</code>
+    </div>
+    <div class="row">
+      <span class="label">Sessions</span>
+      <span id="active-convos" class="value">0</span>
+    </div>
+  </section>
+
+  <section class="controls">
+    <button id="open-sidepanel-btn" class="btn btn-primary" type="button">
+      Open Side Panel
+    </button>
+    <div class="btn-grid">
+      <button id="group-tab-btn" class="btn btn-secondary" type="button">
+        Group Tab
+      </button>
+      <button id="pause-btn" class="btn btn-secondary" type="button">
+        Pause
+      </button>
+    </div>
+    <button id="reconnect-btn" class="btn btn-ghost" type="button">
+      Reconnect Bridge
+    </button>
+  </section>
+
+  <section class="log-section">
+    <div class="log-header">
+      <span>Recent Activity</span>
+      <button id="clear-logs-btn" class="link-btn" type="button">Clear</button>
+    </div>
+    <ul id="action-log-list" class="log-list">
+      <li class="log-empty">No actions yet.</li>
+    </ul>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>

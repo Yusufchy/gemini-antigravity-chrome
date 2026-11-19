@@ -1,0 +1,80 @@
+{
+  "manifest_version": 3,
+  "name": "Gemini Antigravity in Chrome",
+  "short_name": "Antigravity",
+  "version": "2.1.0",
+  "description": "Autonomous browser control, DOM & Shadow DOM inspection, multi-tab synthesis, and live session bridge for Google Antigravity.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwrB9DPe4/90DIa3puoFywyQTbgL08qxmV0FZVVtXfdujTPiYvxhv71BjY3g2yMbU+YnIBDtRltRNWehtHyw3iH+m1uZ3BR9dds66fIKsyUVBjW/6QOrjpvBgl4KGFTQm/bMmdN4ZvWqpCeibE/+vg30yv4WJeoDge5brrOuCWBCC4ysSMZq1mNCsRp84hkgVxrBrJwqPt+KvWViaKFU4/MMfvSd4NkkIldmAflJwsvAtlVkoURiv4unxwxd35TPPWEH8DwSAdG8tkqTrNPT0jSXhrNsxCqfxdpwuxfN3KACgCg7pXMC6hQI82ZHyNx+FmBRqy2djpmieZP27iSVp6wIDAQAB",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "Antigravity",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "scripting",
+    "debugger",
+    "storage",
+    "alarms",
+    "sidePanel",
+    "contextMenus",
+    "notifications",
+    "nativeMessaging",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content/content-script.js"
+      ],
+      "css": [
+        "content/content-style.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "open-side-panel": {
+      "suggested_key": {
+        "default": "Alt+Shift+A"
+      },
+      "description": "Open the Antigravity Side Panel"
+    },
+    "toggle-pause-control": {
+      "suggested_key": {
+        "default": "Alt+Shift+P"
+      },
+      "description": "Pause or resume Antigravity browser control"
+    },
+    "pick-page-element": {
+      "suggested_key": {
+        "default": "Alt+Shift+X"
+      },
+      "description": "Pick an element on the current page"
+    }
+  }
+}

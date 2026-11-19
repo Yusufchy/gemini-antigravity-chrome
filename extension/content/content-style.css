@@ -1,0 +1,246 @@
+/* Gemini Antigravity in Chrome v2.0 - Minimalist HUD, Picker, Snip & Set-of-Marks Overlay */
+
+#agy-chrome-hud-root {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2147483646;
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Subtle minimalist viewport indicator */
+#agy-chrome-viewport-frame {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 1.5px rgba(250, 250, 250, 0.35), inset 0 0 0 3px rgba(9, 9, 11, 0.25);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  z-index: 2147483645;
+}
+
+#agy-chrome-viewport-frame.agy-active {
+  opacity: 1;
+}
+
+#agy-chrome-viewport-frame.agy-paused {
+  box-shadow: inset 0 0 0 2px rgba(217, 119, 6, 0.85);
+}
+
+/* Minimal obsidian floating HUD pill */
+#agy-chrome-status-pill {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%) translateY(12px);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px 6px 12px;
+  background: rgba(9, 9, 11, 0.92);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  color: #fafafa;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.18s ease, transform 0.18s ease, visibility 0.18s;
+  z-index: 2147483647;
+}
+
+#agy-chrome-status-pill.agy-visible {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+}
+
+.agy-pulse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #fafafa;
+  animation: agy-pulse 1.6s infinite ease-in-out;
+  flex-shrink: 0;
+}
+
+.agy-pulse-dot.agy-paused {
+  background: #f59e0b;
+  animation: none;
+}
+
+@keyframes agy-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+#agy-chrome-status-text {
+  max-width: 320px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #e4e4e7;
+}
+
+#agy-chrome-pause-btn {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fafafa;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+#agy-chrome-pause-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Monochrome geometric agent cursor */
+#agy-chrome-cursor {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 20px;
+  height: 20px;
+  pointer-events: none;
+  z-index: 2147483647;
+  transform: translate(-100px, -100px);
+  opacity: 0;
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.45));
+  will-change: transform;
+}
+
+#agy-chrome-cursor.agy-visible {
+  opacity: 1;
+}
+
+#agy-chrome-cursor.agy-clicking svg {
+  transform: scale(0.84);
+  transition: transform 0.1s ease;
+}
+
+.agy-click-ripple {
+  position: fixed;
+  pointer-events: none;
+  border-radius: 50%;
+  border: 1.5px solid #18181b;
+  box-shadow: 0 0 0 1.5px rgba(250, 250, 250, 0.9);
+  transform: translate(-50%, -50%) scale(0.25);
+  opacity: 1;
+  animation: agy-ripple-expand 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  z-index: 2147483646;
+}
+
+@keyframes agy-ripple-expand {
+  0% { transform: translate(-50%, -50%) scale(0.25); opacity: 1; }
+  100% { transform: translate(-50%, -50%) scale(2.1); opacity: 0; }
+}
+
+.agy-highlight-box {
+  position: fixed;
+  pointer-events: none;
+  border: 1.5px solid #18181b;
+  box-shadow: 0 0 0 1px rgba(250, 250, 250, 0.85);
+  background: rgba(24, 24, 27, 0.06);
+  border-radius: 4px;
+  z-index: 2147483646;
+  transition: all 0.12s ease-out;
+}
+
+/* Set-of-Marks (SoM) Minimalist Monochrome Badges */
+.agy-som-badge {
+  position: fixed;
+  pointer-events: none;
+  z-index: 2147483647;
+  background: #09090b;
+  color: #fafafa;
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  border-radius: 3px;
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.35);
+}
+
+.agy-som-outline {
+  position: fixed;
+  pointer-events: none;
+  z-index: 2147483646;
+  border: 1px dashed rgba(24, 24, 27, 0.75);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.45);
+  border-radius: 2px;
+}
+
+/* Interactive Element Picker & Region Snip Overlays */
+#agy-picker-shield {
+  position: fixed;
+  inset: 0;
+  pointer-events: auto;
+  cursor: crosshair;
+  z-index: 2147483647;
+  background: transparent;
+}
+
+#agy-picker-shield.agy-snip-mode {
+  background: rgba(9, 9, 11, 0.28);
+}
+
+#agy-picker-box {
+  position: fixed;
+  pointer-events: none;
+  border: 1.5px solid #09090b;
+  box-shadow: 0 0 0 1.5px #fafafa, 0 4px 16px rgba(0, 0, 0, 0.2);
+  background: rgba(250, 250, 250, 0.08);
+  border-radius: 3px;
+  z-index: 2147483647;
+}
+
+#agy-picker-label {
+  position: fixed;
+  pointer-events: none;
+  background: #09090b;
+  color: #fafafa;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: nowrap;
+  z-index: 2147483647;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+/* Minimalist Toast */
+#agy-chrome-toast {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  background: #09090b;
+  color: #fafafa;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 2147483647;
+  opacity: 0;
+  transform: translateY(-8px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  pointer-events: none;
+}
+
+#agy-chrome-toast.agy-show {
+  opacity: 1;
+  transform: translateY(0);
+}
