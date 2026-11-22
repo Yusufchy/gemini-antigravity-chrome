@@ -93,33 +93,321 @@ const MUTATING_METHODS = new Set([
   'chrome_press_key',
   'chrome_drag_and_drop',
   'chrome_upload_file',
-  'chrome_evaluate'
+  'chrome_evaluate',
+  'chrome_batch_actions'
 ]);
+
+const TAB_WRITE_LOCK_METHODS = new Set([
+  'chrome_click',
+  'chrome_type',
+  'chrome_select_option',
+  'chrome_fill_form',
+  'chrome_press_key',
+  'chrome_drag_and_drop',
+  'chrome_upload_file',
+  'chrome_scroll',
+  'chrome_evaluate',
+  'chrome_emulate',
+  'chrome_resize_viewport',
+  'chrome_handle_dialog',
+  'chrome_batch_actions'
+]);
+
+const TAB_READ_LOCK_METHODS = new Set([
+  'chrome_read_page',
+  'chrome_deep_read',
+  'chrome_get_page_text',
+  'chrome_find_elements',
+  'chrome_inspect_element',
+  'chrome_extract_data',
+  'chrome_audit_page',
+  'chrome_get_console_logs',
+  'chrome_get_network_logs',
+  'chrome_screenshot',
+  'chrome_watch_page',
+  'chrome_save_pdf',
+  '_ext_download_fetch_in_page',
+  '_ext_get_cookies_for_url'
+]);
+
+const AGENT_GROUP_COLORS = ['blue', 'green', 'orange', 'purple', 'cyan', 'pink', 'yellow', 'red'];
 
 let wsConnection = null;
 let wsConnecting = false;
 let nativePort = null;
 let offscreenCreating = false;
 
-// --- Persistent State Helpers (Mandatory Rule #7: chrome.storage) ---
+// --- v2.2.0 Write-Through State Cache & Debounced Action Log (Zero Storage Thrashing) ---
+let cachedLocalState = null;
+let cachedSessionMeta = null;
+let cachedDownloadSummary = null;
+let pendingLogEntries = [];
+let logFlushTimer = null;
+const engineStats = {
+  warmCacheHits: 0,
+  coldCacheInjects: 0,
+  rwReadLocks: 0,
+  rwWriteLocks: 0
+};
+
+// Ready-Tab Content Script Cache (eliminates redundant PING_CONTENT IPC round-trips)
+const readyContentTabs = new Set();
+
+// Per-Tab Writer-Preference Fair Reader-Writer Lock (TabRWLock)
+class TabLockManager {
+  constructor() {
+    this.slots = new Map(); // tabId -> { readers, writerActive, waitingReaders: [], waitingWriters: [] }
+  }
+
+  _slot(tabId) {
+    let s = this.slots.get(tabId);
+    if (!s) {
+      s = { readers: 0, writerActive: false, waitingReaders: [], waitingWriters: [] };
+      this.slots.set(tabId, s);
+    }
+    return s;
+  }
+
+  async acquireRead(tabId, timeoutMs = 30000) {
+    engineStats.rwReadLocks++;
+    const s = this._slot(tabId);
+    if (!s.writerActive && s.waitingWriters.length === 0) {
+      s.readers++;
+      return;
+    }
+    await new Promise((resolve, reject) => {
+      const entry = {
+        resolve: () => {
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+      const timer = setTimeout(() => {
+        const idx = s.waitingReaders.indexOf(entry);
+        if (idx !== -1) s.waitingReaders.splice(idx, 1);
+        reject(new Error(`Timed out waiting for read lock on tab ${tabId}`));
+      }, timeoutMs);
+      s.waitingReaders.push(entry);
+    });
+  }
+
+  releaseRead(tabId) {
+    const s = this.slots.get(tabId);
+    if (!s) return;
+    s.readers = Math.max(0, s.readers - 1);
+    this._dispatchNext(tabId, s);
+  }
+
+  async acquireWrite(tabId, timeoutMs = 30000) {
+    engineStats.rwWriteLocks++;
+    const s = this._slot(tabId);
+    if (!s.writerActive && s.readers === 0) {
+      s.writerActive = true;
+      return;
+    }
+    await new Promise((resolve, reject) => {
+      const entry = {
+        resolve: () => {
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+      const timer = setTimeout(() => {
+        const idx = s.waitingWriters.indexOf(entry);
+        if (idx !== -1) s.waitingWriters.splice(idx, 1);
+        reject(new Error(`Timed out waiting for write lock on tab ${tabId}`));
+      }, timeoutMs);
+      s.waitingWriters.push(entry);
+    });
+  }
+
+  releaseWrite(tabId) {
+    const s = this.slots.get(tabId);
+    if (!s) return;
+    s.writerActive = false;
+    this._dispatchNext(tabId, s);
+  }
+
+  _dispatchNext(tabId, s) {
+    if (s.writerActive) return;
+    if (s.readers === 0 && s.waitingWriters.length > 0) {
+      s.writerActive = true;
+      const nextWriter = s.waitingWriters.shift();
+      nextWriter.resolve();
+      return;
+    }
+    if (s.waitingWriters.length === 0 && s.waitingReaders.length > 0) {
+      while (s.waitingReaders.length > 0) {
+        s.readers++;
+        const nextReader = s.waitingReaders.shift();
+        nextReader.resolve();
+      }
+      return;
+    }
+    if (s.readers === 0 && !s.writerActive && s.waitingReaders.length === 0 && s.waitingWriters.length === 0) {
+      this.slots.delete(tabId);
+    }
+  }
+
+  async withRead(tabId, fn) {
+    await this.acquireRead(tabId);
+    try {
+      return await fn();
+    } finally {
+      this.releaseRead(tabId);
+    }
+  }
+
+  async withWrite(tabId, fn) {
+    await this.acquireWrite(tabId);
+    try {
+      return await fn();
+    } finally {
+      this.releaseWrite(tabId);
+    }
+  }
+
+  cleanupTab(tabId) {
+    this.slots.delete(tabId);
+  }
+
+  getActiveLockCount() {
+    return this.slots.size;
+  }
+}
+
+const tabLocks = new TabLockManager();
+
+// Multi-Agent Session Registry (backed by chrome.storage.session for MV3 restart resilience)
+let agentSessionsCache = null;
+
+async function loadAgentSessions() {
+  if (agentSessionsCache) return agentSessionsCache;
+  try {
+    const data = await chrome.storage.session.get('agentSessions');
+    agentSessionsCache = data?.agentSessions && typeof data.agentSessions === 'object' ? data.agentSessions : {};
+  } catch (_e) {
+    agentSessionsCache = {};
+  }
+  return agentSessionsCache;
+}
+
+async function saveAgentSessions(sessions) {
+  agentSessionsCache = sessions;
+  await chrome.storage.session.set({ agentSessions: sessions }).catch(() => {});
+}
+
+function findTabOwnerAgent(sessions, tabId) {
+  for (const [id, sess] of Object.entries(sessions || {})) {
+    if (Array.isArray(sess.tabIds) && sess.tabIds.includes(tabId)) {
+      return { agentId: id, session: sess };
+    }
+  }
+  return null;
+}
+
+// Synchronous Top-Level Cache Invalidation & Download Listeners (MV3 Rule #7)
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && cachedLocalState) {
+    for (const [k, { newValue }] of Object.entries(changes)) {
+      cachedLocalState[k] = newValue;
+    }
+  } else if (area === 'session') {
+    if (changes.agentSessions) {
+      agentSessionsCache = changes.agentSessions.newValue || {};
+    }
+    if (cachedSessionMeta && (changes.gifRecording || changes.macroSession)) {
+      if (changes.gifRecording) cachedSessionMeta.gifRecording = changes.gifRecording.newValue;
+      if (changes.macroSession) cachedSessionMeta.macroSession = changes.macroSession.newValue;
+    }
+  }
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === 'loading' || changeInfo.url) {
+    readyContentTabs.delete(tabId);
+  }
+});
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  readyContentTabs.delete(tabId);
+  tabLocks.cleanupTab(tabId);
+  const sessions = await loadAgentSessions();
+  let dirty = false;
+  for (const sess of Object.values(sessions)) {
+    if (Array.isArray(sess.tabIds) && sess.tabIds.includes(tabId)) {
+      sess.tabIds = sess.tabIds.filter((id) => id !== tabId);
+      if (sess.defaultTabId === tabId) {
+        sess.defaultTabId = sess.tabIds[sess.tabIds.length - 1] || null;
+      }
+      dirty = true;
+    }
+  }
+  if (dirty) await saveAgentSessions(sessions);
+});
+
+// Real-Time chrome.downloads Push Pipeline -> Bridge Hub DownloadManager
+function pushDownloadEventToHub(kind, downloadId, item = null) {
+  if (!wsConnection || wsConnection.readyState !== WebSocket.OPEN) return;
+  try {
+    wsConnection.send(
+      JSON.stringify({
+        type: 'DOWNLOAD_EVENT',
+        event: { kind, downloadId, item, timestamp: Date.now() }
+      })
+    );
+  } catch (_e) {}
+}
+
+if (chrome.downloads) {
+  chrome.downloads.onCreated.addListener((item) => {
+    pushDownloadEventToHub('created', item.id, item);
+  });
+
+  chrome.downloads.onChanged.addListener(async (delta) => {
+    if (!delta || typeof delta.id !== 'number') return;
+    if (delta.state || delta.filename || delta.error || delta.totalBytes) {
+      try {
+        const [item] = await chrome.downloads.search({ id: delta.id });
+        if (item) pushDownloadEventToHub('changed', delta.id, item);
+      } catch (_e) {}
+    }
+  });
+
+  chrome.downloads.onErased.addListener((downloadId) => {
+    pushDownloadEventToHub('erased', downloadId, null);
+  });
+}
+
+// --- Persistent State Helpers (Write-Through Cache + chrome.storage) ---
+const LOCAL_STATE_KEYS = [
+  'connected',
+  'bridgePort',
+  'antigravityInfo',
+  'paused',
+  'autonomyMode',
+  'domainRules',
+  'autoGroupTabs',
+  'controlledTabId',
+  'tabGroupId',
+  'actionLogs',
+  'shortcuts',
+  'schedules',
+  'themePreference',
+  'preferredModel',
+  'downloadsSummary'
+];
+
 async function getBridgeState() {
-  const data = await chrome.storage.local.get([
-    'connected',
-    'bridgePort',
-    'antigravityInfo',
-    'paused',
-    'autonomyMode',
-    'domainRules',
-    'autoGroupTabs',
-    'controlledTabId',
-    'tabGroupId',
-    'actionLogs',
-    'shortcuts',
-    'schedules',
-    'themePreference',
-    'preferredModel'
-  ]);
-  const sess = await chrome.storage.session.get(['gifRecording', 'macroSession']).catch(() => ({}));
+  if (!cachedLocalState) {
+    cachedLocalState = await chrome.storage.local.get(LOCAL_STATE_KEYS);
+  }
+  if (!cachedSessionMeta) {
+    cachedSessionMeta = await chrome.storage.session.get(['gifRecording', 'macroSession']).catch(() => ({}));
+  }
+  const data = cachedLocalState;
+  const sess = cachedSessionMeta;
+  const sessions = await loadAgentSessions();
   return {
     connected: Boolean(data.connected),
     bridgePort: data.bridgePort || 17380,
@@ -138,18 +426,42 @@ async function getBridgeState() {
     gifRecording: Boolean(sess?.gifRecording?.active),
     gifFrameCount: sess?.gifRecording?.frames?.length || 0,
     macroRecording: Boolean(sess?.macroSession?.active),
-    macroStepCount: sess?.macroSession?.steps?.length || 0
+    macroStepCount: sess?.macroSession?.steps?.length || 0,
+    activeAgentCount: Object.keys(sessions).length,
+    downloadsSummary: cachedDownloadSummary || data.downloadsSummary || null
   };
 }
 
-async function updateBridgeState(patch) {
+async function updateBridgeState(patch, { silent = false } = {}) {
+  if (!cachedLocalState) {
+    cachedLocalState = await chrome.storage.local.get(LOCAL_STATE_KEYS);
+  }
+  Object.assign(cachedLocalState, patch);
   await chrome.storage.local.set(patch);
-  await updateActionBadge();
-  await broadcastStateToViews();
+  if (!silent) {
+    await updateActionBadge();
+    await broadcastStateToViews();
+  }
+}
+
+function scheduleLogFlush() {
+  if (logFlushTimer) return;
+  logFlushTimer = setTimeout(async () => {
+    logFlushTimer = null;
+    if (pendingLogEntries.length === 0) return;
+    const batch = pendingLogEntries.splice(0);
+    if (!cachedLocalState) {
+      cachedLocalState = await chrome.storage.local.get(LOCAL_STATE_KEYS);
+    }
+    const existing = Array.isArray(cachedLocalState.actionLogs) ? cachedLocalState.actionLogs : [];
+    const updated = [...batch.reverse(), ...existing].slice(0, 120);
+    cachedLocalState.actionLogs = updated;
+    await chrome.storage.local.set({ actionLogs: updated }).catch(() => {});
+    await broadcastStateToViews();
+  }, 150);
 }
 
 async function appendActionLog(action, details, status = 'ok') {
-  const { actionLogs = [] } = await chrome.storage.local.get('actionLogs');
   const entry = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     timestamp: new Date().toISOString(),
@@ -157,9 +469,8 @@ async function appendActionLog(action, details, status = 'ok') {
     details: typeof details === 'string' ? details : JSON.stringify(details).slice(0, 300),
     status
   };
-  const updated = [entry, ...actionLogs].slice(0, 120);
-  await chrome.storage.local.set({ actionLogs: updated });
-  await broadcastStateToViews();
+  pendingLogEntries.push(entry);
+  scheduleLogFlush();
   return entry;
 }
 
@@ -515,10 +826,19 @@ function attemptWsPort(port) {
         try {
           const message = JSON.parse(event.data);
           if (message.type === 'BRIDGE_WELCOME') {
+            if (message.downloads) {
+              cachedDownloadSummary = message.downloads;
+            }
             await updateBridgeState({
               connected: true,
-              antigravityInfo: message.antigravity || null
+              antigravityInfo: message.antigravity || null,
+              ...(message.downloads ? { downloadsSummary: message.downloads } : {})
             });
+            return;
+          }
+          if (message.type === 'DOWNLOAD_STATE_SYNC' && message.downloads) {
+            cachedDownloadSummary = message.downloads;
+            await updateBridgeState({ downloadsSummary: message.downloads });
             return;
           }
           if (message.type === 'PING') {
@@ -543,30 +863,35 @@ function attemptWsPort(port) {
             return;
           }
           if (message.type === 'RPC_REQUEST') {
-            await broadcastToViews({
-              type: 'LIVE_TOOL_EVENT',
-              phase: 'start',
-              id: message.id,
-              method: message.method,
-              params: message.params
-            });
-            const response = await handleBridgeRpc(message);
-            await broadcastToViews({
-              type: 'LIVE_TOOL_EVENT',
-              phase: response.ok ? 'done' : 'error',
-              id: message.id,
-              method: message.method,
-              error: response.error || null
-            });
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(
-                JSON.stringify({
-                  type: 'RPC_RESPONSE',
-                  id: message.id,
-                  ...response
-                })
-              );
-            }
+            // Fire-and-forget concurrent dispatch so parallel agents never head-of-line block each other
+            (async () => {
+              broadcastToViews({
+                type: 'LIVE_TOOL_EVENT',
+                phase: 'start',
+                id: message.id,
+                method: message.method,
+                agentId: message.params?.agentId || null,
+                params: message.params
+              });
+              const response = await handleBridgeRpc(message);
+              broadcastToViews({
+                type: 'LIVE_TOOL_EVENT',
+                phase: response.ok ? 'done' : 'error',
+                id: message.id,
+                method: message.method,
+                agentId: message.params?.agentId || null,
+                error: response.error || null
+              });
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({
+                    type: 'RPC_RESPONSE',
+                    id: message.id,
+                    ...response
+                  })
+                );
+              }
+            })();
           }
         } catch (err) {
           console.error('[Antigravity SW] WS message error:', err);
@@ -592,13 +917,9 @@ function attemptWsPort(port) {
   });
 }
 
-// --- Content Script Auto-Injection ---
-async function ensureContentScriptReady(tabId) {
-  try {
-    const res = await chrome.tabs.sendMessage(tabId, { type: 'PING_CONTENT' });
-    if (res?.ok) return true;
-  } catch (_err) {}
-
+// --- Fast Content Script Auto-Injection (Ready-Tab Warm Cache: -50% IPC Latency) ---
+async function injectContentScript(tabId) {
+  engineStats.coldCacheInjects++;
   await chrome.scripting.insertCSS({
     target: { tabId },
     files: ['content/content-style.css']
@@ -607,11 +928,47 @@ async function ensureContentScriptReady(tabId) {
     target: { tabId },
     files: ['content/content-script.js']
   });
-  await new Promise((r) => setTimeout(r, 60));
+  await new Promise((r) => setTimeout(r, 35));
+  readyContentTabs.add(tabId);
+}
+
+async function ensureContentScriptReady(tabId) {
+  if (readyContentTabs.has(tabId)) {
+    engineStats.warmCacheHits++;
+    return true;
+  }
+  try {
+    const res = await chrome.tabs.sendMessage(tabId, { type: 'PING_CONTENT' });
+    if (res?.ok) {
+      readyContentTabs.add(tabId);
+      engineStats.warmCacheHits++;
+      return true;
+    }
+  } catch (_err) {}
+
+  await injectContentScript(tabId);
   return true;
 }
 
 async function sendToContentScript(tabId, type, params = {}) {
+  if (readyContentTabs.has(tabId)) {
+    engineStats.warmCacheHits++;
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, { type, params });
+      if (!response?.ok) {
+        throw new Error(response?.error || `Content script failed on ${type}`);
+      }
+      return response.result;
+    } catch (err) {
+      // Only re-inject if messaging failed because content script wasn't injected yet
+      const msg = String(err?.message || '');
+      if (!/Receiving end does not exist|Could not establish connection|message port closed/i.test(msg)) {
+        throw err;
+      }
+      readyContentTabs.delete(tabId);
+    }
+  }
+
   await ensureContentScriptReady(tabId);
   const response = await chrome.tabs.sendMessage(tabId, { type, params });
   if (!response?.ok) {
@@ -620,11 +977,23 @@ async function sendToContentScript(tabId, type, params = {}) {
   return response.result;
 }
 
-// --- Tab Resolution & Group Management ---
-async function resolveTargetTab(tabId) {
+// --- Multi-Agent Tab Resolution & Color-Coded Group Management ---
+async function resolveTargetTab(tabId, agentId = null) {
   if (tabId) {
     const tab = await chrome.tabs.get(Number(tabId));
     if (tab) return tab;
+  }
+  if (agentId) {
+    const sessions = await loadAgentSessions();
+    const sess = sessions[String(agentId)];
+    if (sess?.defaultTabId) {
+      try {
+        const agentTab = await chrome.tabs.get(Number(sess.defaultTabId));
+        if (agentTab && agentTab.url && !agentTab.url.startsWith('chrome://')) {
+          return agentTab;
+        }
+      } catch (_err) {}
+    }
   }
   const { controlledTabId } = await getBridgeState();
   if (controlledTabId) {
@@ -643,6 +1012,52 @@ async function resolveTargetTab(tabId) {
   const validTab = allTabs.find((t) => t.url && /^https?:/i.test(t.url));
   if (validTab) return validTab;
   throw new Error('No controllable HTTP/HTTPS tab is open in Chrome. Call chrome_open_url first.');
+}
+
+async function addTabToAgentGroup(tabId, windowId, agentId = null, requestedColor = null) {
+  if (!agentId) return await addTabToAntigravityGroup(tabId, windowId);
+  const sessions = await loadAgentSessions();
+  const id = String(agentId);
+  const existing = sessions[id];
+  const color =
+    requestedColor ||
+    existing?.color ||
+    AGENT_GROUP_COLORS[Object.keys(sessions).length % AGENT_GROUP_COLORS.length];
+
+  try {
+    let groupId = existing?.tabGroupId || null;
+    if (groupId) {
+      try {
+        await chrome.tabGroups.get(groupId);
+      } catch (_e) {
+        groupId = null;
+      }
+    }
+    if (groupId) {
+      await chrome.tabs.group({ groupId, tabIds: [tabId] });
+    } else {
+      groupId = await chrome.tabs.group({
+        createProperties: windowId ? { windowId } : undefined,
+        tabIds: [tabId]
+      });
+      await chrome.tabGroups.update(groupId, {
+        title: `${TAB_GROUP_TITLE} · ${id}`.slice(0, 26),
+        color,
+        collapsed: false
+      });
+    }
+    if (existing) {
+      existing.tabGroupId = groupId;
+      existing.color = color;
+      if (!existing.tabIds.includes(tabId)) existing.tabIds.push(tabId);
+      existing.defaultTabId = tabId;
+      existing.lastActiveAt = Date.now();
+      await saveAgentSessions(sessions);
+    }
+    return groupId;
+  } catch (_err) {
+    return null;
+  }
 }
 
 async function addTabToAntigravityGroup(tabId, windowId) {
@@ -671,7 +1086,7 @@ async function addTabToAntigravityGroup(tabId, windowId) {
         color: TAB_GROUP_COLOR,
         collapsed: false
       });
-      await chrome.storage.local.set({ tabGroupId: groupId });
+      await updateBridgeState({ tabGroupId: groupId }, { silent: true });
     }
     return groupId;
   } catch (_err) {
@@ -679,33 +1094,78 @@ async function addTabToAntigravityGroup(tabId, windowId) {
   }
 }
 
+// Event-Driven Tab Load Waiter (zero 140ms polling waste!)
 async function waitForTabComplete(tabId, timeoutMs = 15000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.status === 'complete') return tab;
-    await new Promise((r) => setTimeout(r, 140));
+  const initial = await chrome.tabs.get(tabId);
+  if (initial.status === 'complete' && initial.url && initial.url !== 'about:blank') {
+    return initial;
   }
-  return await chrome.tabs.get(tabId);
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = async () => {
+      if (settled) return;
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      chrome.tabs.onRemoved.removeListener(onRemoved);
+      clearTimeout(timer);
+      try {
+        resolve(await chrome.tabs.get(tabId));
+      } catch (_e) {
+        resolve(initial);
+      }
+    };
+
+    const onUpdated = (updatedId, changeInfo) => {
+      if (updatedId === tabId && changeInfo.status === 'complete') {
+        finish();
+      }
+    };
+    const onRemoved = (removedId) => {
+      if (removedId === tabId) finish();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+
+    // Re-check once after attaching listener to close race window
+    chrome.tabs
+      .get(tabId)
+      .then((t) => {
+        if (t.status === 'complete' && t.url && t.url !== 'about:blank') finish();
+      })
+      .catch(() => finish());
+  });
 }
 
 async function listBrowserTabs(params = {}) {
   const tabs = await chrome.tabs.query(params.currentWindowOnly ? { lastFocusedWindow: true } : {});
   const { controlledTabId, tabGroupId } = await getBridgeState();
-  return tabs.map((t) => ({
-    tabId: t.id,
-    windowId: t.windowId,
-    index: t.index,
-    title: t.title || '',
-    url: t.url || '',
-    pinned: Boolean(t.pinned),
-    audible: Boolean(t.audible),
-    active: t.active,
-    status: t.status,
-    groupId: t.groupId,
-    inAntigravityGroup: Boolean(tabGroupId && t.groupId === tabGroupId),
-    isControlled: t.id === controlledTabId
-  }));
+  const sessions = await loadAgentSessions();
+  const mapped = tabs.map((t) => {
+    const owner = findTabOwnerAgent(sessions, t.id);
+    return {
+      tabId: t.id,
+      windowId: t.windowId,
+      index: t.index,
+      title: t.title || '',
+      url: t.url || '',
+      pinned: Boolean(t.pinned),
+      audible: Boolean(t.audible),
+      active: t.active,
+      status: t.status,
+      groupId: t.groupId,
+      inAntigravityGroup: Boolean(tabGroupId && t.groupId === tabGroupId),
+      isControlled: t.id === controlledTabId,
+      ownerAgentId: owner?.agentId || null,
+      exclusiveLease: Boolean(owner?.session?.exclusive)
+    };
+  });
+  if (params.agentId) {
+    return mapped.filter((t) => t.ownerAgentId === String(params.agentId));
+  }
+  return mapped;
 }
 
 // --- Non-Disruptive Tab Image Capture (Works on Background Tabs & Minimized Windows via CDP Fallback) ---
@@ -791,7 +1251,33 @@ function computeLineDiff(beforeText = '', afterText = '') {
   };
 }
 
-// --- Core 34-Tool RPC Dispatcher ---
+// --- Core 42-Tool Concurrent RPC Dispatcher (with Per-Tab Fair RWLock & Agent Lease Guard) ---
+async function checkExclusiveAgentOwnership(tabId, agentId, force = false) {
+  if (force) return;
+  const sessions = await loadAgentSessions();
+  const owner = findTabOwnerAgent(sessions, tabId);
+  if (owner && owner.session.exclusive && owner.agentId !== String(agentId || '')) {
+    throw new Error(
+      `Tab ${tabId} is exclusively leased by agent "${owner.agentId}". Use your own tab via chrome_agent_session or pass force=true.`
+    );
+  }
+}
+
+async function runPool(items, concurrency, fn) {
+  const limit = Math.max(1, Math.min(12, Number(concurrency) || 6, items.length || 1));
+  const out = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+  return out;
+}
+
 async function handleBridgeRpc(request) {
   const { method, params = {} } = request;
   const state = await getBridgeState();
@@ -801,7 +1287,7 @@ async function handleBridgeRpc(request) {
     return { ok: true, result: { reloading: true } };
   }
 
-  if (state.paused && !['chrome_status', 'chrome_list_tabs'].includes(method)) {
+  if (state.paused && !['chrome_status', 'chrome_list_tabs', '_ext_downloads_search'].includes(method)) {
     return {
       ok: false,
       error: 'Antigravity browser control is currently PAUSED by the user. Ask the user to click Resume in the Side Panel or page HUD.'
@@ -809,10 +1295,37 @@ async function handleBridgeRpc(request) {
   }
 
   try {
+    const isWrite = TAB_WRITE_LOCK_METHODS.has(method);
+    const isRead = TAB_READ_LOCK_METHODS.has(method);
+
+    if (isWrite || isRead) {
+      const preTab = await resolveTargetTab(params.tabId, params.agentId);
+      if (isWrite) {
+        await checkExclusiveAgentOwnership(preTab.id, params.agentId, Boolean(params.force));
+      }
+      const scopedParams = { ...params, tabId: preTab.id };
+      if (isWrite) {
+        return await tabLocks.withWrite(preTab.id, () => _dispatchBridgeRpc(method, scopedParams, state));
+      }
+      return await tabLocks.withRead(preTab.id, () => _dispatchBridgeRpc(method, scopedParams, state));
+    }
+
+    return await _dispatchBridgeRpc(method, params, state);
+  } catch (err) {
+    await appendActionLog(method, err?.message || String(err), 'error');
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+async function _dispatchBridgeRpc(method, params, state) {
+  try {
     switch (method) {
       case 'chrome_status': {
-        const tabs = await listBrowserTabs({});
-        const windows = await chrome.windows.getAll({ populate: false });
+        const [tabs, windows, sessions] = await Promise.all([
+          listBrowserTabs({}),
+          chrome.windows.getAll({ populate: false }),
+          loadAgentSessions()
+        ]);
         const activeTab = tabs.find((t) => t.active) || null;
         const cdpInfo = activeTab ? getCdpTelemetry(activeTab.tabId) : { activeDialog: null };
         return {
@@ -830,6 +1343,10 @@ async function handleBridgeRpc(request) {
             activeDialog: cdpInfo.activeDialog,
             controlledTabId: state.controlledTabId,
             tabGroupId: state.tabGroupId,
+            activeAgents: Object.keys(sessions),
+            activeAgentCount: Object.keys(sessions).length,
+            activeTabLocks: tabLocks.getActiveLockCount(),
+            engineStats: { ...engineStats, warmTabsCount: readyContentTabs.size },
             windowCount: windows.length,
             tabCount: tabs.length,
             activeTab
@@ -848,29 +1365,38 @@ async function handleBridgeRpc(request) {
         const guard = checkDomainGuardrail(url, 'chrome_click', state);
         if (!guard.allowed) throw new Error(guard.reason);
 
+        // Multi-agent calls default to non-disruptive background tabs unless active: true is explicitly passed
+        const shouldActivate =
+          typeof params.active === 'boolean' ? params.active : params.agentId ? false : true;
+
         let tab;
         if (params.tabId) {
           tab = await chrome.tabs.update(Number(params.tabId), {
             url,
-            active: params.active !== false
+            active: shouldActivate
           });
         } else if (params.newTab !== false) {
           tab = await chrome.tabs.create({
             url,
-            active: params.active !== false
+            active: shouldActivate
           });
         } else {
-          const target = await resolveTargetTab();
-          tab = await chrome.tabs.update(target.id, { url, active: params.active !== false });
+          const target = await resolveTargetTab(null, params.agentId);
+          tab = await chrome.tabs.update(target.id, { url, active: shouldActivate });
         }
 
-        await addTabToAntigravityGroup(tab.id, tab.windowId);
-        await updateBridgeState({ controlledTabId: tab.id });
+        if (params.agentId) {
+          await addTabToAgentGroup(tab.id, tab.windowId, params.agentId);
+        } else {
+          await addTabToAntigravityGroup(tab.id, tab.windowId);
+          await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
+        }
+
         if (params.waitForLoad !== false) {
           tab = await waitForTabComplete(tab.id, params.timeoutMs || 15000);
         }
 
-        await appendActionLog('open_url', `${url} (tab ${tab.id})`);
+        await appendActionLog('open_url', `${url} (tab ${tab.id}${params.agentId ? ` · ${params.agentId}` : ''})`);
         await maybeRecordGifFrame(tab, `Open ${url}`);
 
         let snapshot = null;
@@ -887,6 +1413,7 @@ async function handleBridgeRpc(request) {
           ok: true,
           result: {
             tabId: tab.id,
+            agentId: params.agentId || null,
             url: tab.url,
             title: tab.title,
             status: tab.status,
@@ -895,10 +1422,453 @@ async function handleBridgeRpc(request) {
         };
       }
 
+      case 'chrome_deep_read': {
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
+        if (!params.agentId) {
+          await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
+        }
+        const includeTelemetry = params.includeTelemetry !== false;
+        const cdpInfo = includeTelemetry ? getCdpTelemetry(tab.id) : null;
+
+        let deep;
+        try {
+          deep = await sendToContentScript(tab.id, 'DEEP_READ', params);
+        } catch (err) {
+          if (/\.pdf($|\?|#)/i.test(tab.url || '')) {
+            const pdfText = await extractPdfTextFromUrl(tab.url, params.maxTextLength || 18000);
+            deep = {
+              delta: false,
+              unchanged: false,
+              stateHash: `pdf-${tab.id}`,
+              url: tab.url,
+              title: tab.title,
+              isPdfEmbed: true,
+              elementCount: 0,
+              formattedTree: '(PDF document rendered in Chrome PDF Viewer)',
+              markdown: pdfText,
+              downloadableAssets: [{ url: tab.url, kind: 'pdf_document', label: tab.title || 'PDF' }],
+              safetyGates: []
+            };
+          } else {
+            throw err;
+          }
+        }
+
+        if (deep.isPdfEmbed && !deep.markdown) {
+          deep.markdown = await extractPdfTextFromUrl(tab.url, params.maxTextLength || 18000);
+        }
+
+        if (cdpInfo) {
+          if (cdpInfo.activeDialog) deep.activeDialog = cdpInfo.activeDialog;
+          if (includeTelemetry) {
+            const cdpConsoleErrors = (cdpInfo.consoleLogs || [])
+              .filter((l) => ['error', 'exception', 'assert'].includes(l.level))
+              .slice(-20);
+            const failedRequests = (cdpInfo.networkLogs || [])
+              .filter((r) => r.failed || (typeof r.status === 'number' && r.status >= 400))
+              .slice(-25);
+            deep.telemetry = {
+              cdpAttached: cdpInfo.attached,
+              consoleErrorCount: (deep.contentConsoleErrors?.length || 0) + cdpConsoleErrors.length,
+              cdpConsoleErrors,
+              failedRequestCount: failedRequests.length,
+              failedRequests
+            };
+          }
+        }
+
+        await appendActionLog(
+          'deep_read',
+          `${deep.delta ? (deep.unchanged ? 'unchanged delta' : 'delta') : `${deep.elementCount} el`} · ${tab.title || tab.url}`
+        );
+        return {
+          ok: true,
+          result: {
+            tabId: tab.id,
+            agentId: params.agentId || null,
+            ...deep
+          }
+        };
+      }
+
+      case 'chrome_batch_actions': {
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
+        const guard = checkDomainGuardrail(tab.url, method, state);
+        if (!guard.allowed) throw new Error(guard.reason);
+
+        const steps = Array.isArray(params.steps) ? params.steps : [];
+        if (steps.length === 0) throw new Error('Parameter "steps" must be a non-empty array.');
+
+        const stopOnError = params.stopOnError !== false;
+        const fastMode = params.fast !== false;
+        const started = Date.now();
+        const allResults = [];
+        let stoppedEarly = false;
+        let domChunk = [];
+
+        const flushDom = async () => {
+          if (domChunk.length === 0) return;
+          const batch = domChunk;
+          domChunk = [];
+          const res = await sendToContentScript(tab.id, 'RUN_DOM_BATCH', {
+            steps: batch.map((b) => b.step),
+            stopOnError,
+            fast: fastMode
+          });
+          for (let j = 0; j < (res.results || []).length; j++) {
+            allResults.push({ ...res.results[j], stepIndex: batch[j]?.origIdx ?? allResults.length });
+          }
+          if (res.stoppedEarly) stoppedEarly = true;
+        };
+
+        for (let i = 0; i < steps.length; i++) {
+          if (stoppedEarly) break;
+          const step = steps[i] || {};
+          if (step.action === 'evaluate') {
+            await flushDom();
+            if (stoppedEarly) break;
+            const s0 = Date.now();
+            try {
+              const expr = step.params?.expression || step.params?.script;
+              const val = await cdpEvaluate(tab.id, expr, step.params?.awaitPromise !== false);
+              allResults.push({ stepIndex: i, action: 'evaluate', ok: true, durationMs: Date.now() - s0, result: { value: val } });
+            } catch (err) {
+              allResults.push({ stepIndex: i, action: 'evaluate', ok: false, durationMs: Date.now() - s0, error: err?.message || String(err) });
+              if (stopOnError) stoppedEarly = true;
+            }
+          } else {
+            domChunk.push({ origIdx: i, step });
+          }
+        }
+        if (!stoppedEarly) await flushDom();
+
+        let finalDeepRead = null;
+        if (params.includeFinalDeepRead) {
+          try {
+            finalDeepRead = await sendToContentScript(tab.id, 'DEEP_READ', {});
+          } catch (_e) {}
+        }
+
+        const okCount = allResults.filter((r) => r.ok).length;
+        await appendActionLog('batch_actions', `${okCount}/${allResults.length} steps in ${Date.now() - started}ms (tab ${tab.id})`);
+        return {
+          ok: true,
+          result: {
+            tabId: tab.id,
+            agentId: params.agentId || null,
+            totalSteps: steps.length,
+            executedSteps: allResults.length,
+            okCount,
+            errorCount: allResults.length - okCount,
+            stoppedEarly,
+            durationMs: Date.now() - started,
+            results: allResults,
+            finalDeepRead
+          }
+        };
+      }
+
+      case 'chrome_agent_session': {
+        const action = params.action || 'list';
+        const sessions = await loadAgentSessions();
+
+        if (action === 'list' || action === 'status') {
+          if (action === 'status' && params.agentId) {
+            const sess = sessions[String(params.agentId)] || null;
+            return {
+              ok: true,
+              result: {
+                found: Boolean(sess),
+                session: sess,
+                activeTabLocks: tabLocks.getActiveLockCount(),
+                engineStats: { ...engineStats, warmTabsCount: readyContentTabs.size }
+              }
+            };
+          }
+          return {
+            ok: true,
+            result: {
+              count: Object.keys(sessions).length,
+              sessions: Object.values(sessions),
+              activeTabLocks: tabLocks.getActiveLockCount(),
+              engineStats: { ...engineStats, warmTabsCount: readyContentTabs.size }
+            }
+          };
+        }
+
+        const id = String(params.agentId || '').trim();
+        if (!id) throw new Error('Parameter "agentId" is required for claim, spawn_tab, or release.');
+
+        if (action === 'release') {
+          const existing = sessions[id];
+          const closedTabIds = [];
+          if (existing && params.closeTabs && Array.isArray(existing.tabIds)) {
+            await Promise.allSettled(
+              existing.tabIds.map(async (tid) => {
+                await detachDebugger(tid);
+                await chrome.tabs.remove(tid);
+                closedTabIds.push(tid);
+              })
+            );
+          }
+          delete sessions[id];
+          await saveAgentSessions(sessions);
+          await broadcastStateToViews();
+          await appendActionLog('agent_session', `Released ${id} (closed ${closedTabIds.length} tabs)`);
+          return { ok: true, result: { released: true, agentId: id, closedTabIds } };
+        }
+
+        // claim or spawn_tab
+        const color =
+          params.color ||
+          sessions[id]?.color ||
+          AGENT_GROUP_COLORS[Object.keys(sessions).length % AGENT_GROUP_COLORS.length];
+
+        if (!sessions[id]) {
+          sessions[id] = {
+            agentId: id,
+            tabIds: [],
+            defaultTabId: null,
+            tabGroupId: null,
+            color,
+            exclusive: Boolean(params.exclusive),
+            createdAt: new Date().toISOString(),
+            lastActiveAt: Date.now()
+          };
+        } else {
+          if (typeof params.exclusive === 'boolean') sessions[id].exclusive = params.exclusive;
+          if (params.color) sessions[id].color = params.color;
+          sessions[id].lastActiveAt = Date.now();
+        }
+        await saveAgentSessions(sessions);
+
+        const urlsToOpen = [];
+        if (params.url) urlsToOpen.push(String(params.url));
+        if (Array.isArray(params.urls)) {
+          for (const u of params.urls) if (u) urlsToOpen.push(String(u));
+        }
+
+        const spawnedTabs = [];
+        if (params.tabId) {
+          const t = await chrome.tabs.get(Number(params.tabId));
+          await addTabToAgentGroup(t.id, t.windowId, id, sessions[id].color);
+          spawnedTabs.push({ tabId: t.id, url: t.url, title: t.title });
+        }
+
+        if (urlsToOpen.length > 0) {
+          const openedList = await runPool(urlsToOpen, 6, async (u) => {
+            const guard = checkDomainGuardrail(u, 'chrome_click', state);
+            if (!guard.allowed) throw new Error(guard.reason);
+            let t = await chrome.tabs.create({ url: u, active: Boolean(params.active) });
+            await addTabToAgentGroup(t.id, t.windowId, id, sessions[id].color);
+            if (params.waitForLoad !== false) {
+              t = await waitForTabComplete(t.id, params.timeoutMs || 15000);
+            }
+            return { tabId: t.id, url: t.url, title: t.title };
+          });
+          for (const o of openedList) spawnedTabs.push(o);
+        }
+
+        const updatedSessions = await loadAgentSessions();
+        await broadcastStateToViews();
+        await appendActionLog('agent_session', `${action} ${id} (${updatedSessions[id]?.tabIds?.length || 0} tabs · ${color})`);
+        return {
+          ok: true,
+          result: {
+            action,
+            session: updatedSessions[id],
+            spawnedTabs
+          }
+        };
+      }
+
+      case '_ext_download_start': {
+        if (!chrome.downloads) {
+          throw new Error('chrome.downloads API is unavailable. Reload extension with downloads permission.');
+        }
+        if (!params.url) throw new Error('Parameter "url" is required.');
+        const dlOpts = {
+          url: String(params.url),
+          conflictAction: 'uniquify',
+          saveAs: false
+        };
+        if (params.filename) dlOpts.filename = String(params.filename);
+        const downloadId = await chrome.downloads.download(dlOpts);
+        await appendActionLog('download_file', `Started Chrome download #${downloadId}`);
+        return { ok: true, result: { downloadId } };
+      }
+
+      case '_ext_downloads_search': {
+        if (!chrome.downloads) return { ok: true, result: { items: [] } };
+        const items = await chrome.downloads.search({
+          orderBy: ['-startTime'],
+          limit: Math.min(200, Number(params.limit) || 40)
+        });
+        return { ok: true, result: { items } };
+      }
+
+      case '_ext_download_fetch_in_page': {
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
+        const fetched = await sendToContentScript(tab.id, 'FETCH_RESOURCE_IN_PAGE', {
+          url: params.url,
+          filename: params.filename
+        });
+        await appendActionLog('download_file', `In-page fetched ${fetched.sizeBytes} bytes from tab ${tab.id}`);
+        return { ok: true, result: { tabId: tab.id, ...fetched } };
+      }
+
+      case '_ext_download_click_smart': {
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
+        const guard = checkDomainGuardrail(tab.url, 'chrome_click', state);
+        if (!guard.allowed) throw new Error(guard.reason);
+
+        // 1. Check if target itself is a direct <a href download> link before clicking
+        let directLink = null;
+        try {
+          directLink = await sendToContentScript(tab.id, 'INSPECT_DOWNLOAD_LINK', {
+            ref: params.ref,
+            selector: params.selector,
+            text: params.text
+          });
+        } catch (_e) {}
+
+        if (directLink?.href && (/^blob:|^data:/i.test(directLink.href) || directLink.hasDownloadAttr)) {
+          if (/^blob:|^data:/i.test(directLink.href)) {
+            const fetched = await sendToContentScript(tab.id, 'FETCH_RESOURCE_IN_PAGE', {
+              url: directLink.href,
+              filename: directLink.suggestedFilename || undefined
+            });
+            return {
+              ok: true,
+              result: {
+                tabId: tab.id,
+                capturedUrl: directLink.href,
+                suggestedFilename: directLink.suggestedFilename || fetched.filename,
+                ...fetched
+              }
+            };
+          }
+          return {
+            ok: true,
+            result: {
+              tabId: tab.id,
+              capturedUrl: directLink.href,
+              suggestedFilename: directLink.suggestedFilename || null,
+              name: directLink.name || null
+            }
+          };
+        }
+
+        // 2. Arm a 1-shot MAIN-world HTMLAnchorElement.prototype.click interceptor so JS Blob/CSV/JSON
+        //    export buttons never trigger Chrome's blocking OS "Save As" dialog!
+        const armExpr = `(() => {
+          const origClick = window.__chromeAgentOrigAnchorClick || HTMLAnchorElement.prototype.click;
+          window.__chromeAgentOrigAnchorClick = origClick;
+          window.__chromeAgentCapturedDl = null;
+          HTMLAnchorElement.prototype.click = function() {
+            const href = this.getAttribute('href') || this.href || '';
+            const hasDl = this.hasAttribute('download');
+            if (hasDl || /^blob:|^data:/i.test(href)) {
+              window.__chromeAgentCapturedDl = {
+                href: this.href || href,
+                suggestedFilename: this.getAttribute('download') || null
+              };
+              return;
+            }
+            return origClick.apply(this, arguments);
+          };
+          return true;
+        })()`;
+
+        const disarmAndReadExpr = `(() => {
+          const cap = window.__chromeAgentCapturedDl || null;
+          if (window.__chromeAgentOrigAnchorClick) {
+            HTMLAnchorElement.prototype.click = window.__chromeAgentOrigAnchorClick;
+            delete window.__chromeAgentOrigAnchorClick;
+          }
+          delete window.__chromeAgentCapturedDl;
+          return cap;
+        })()`;
+
+        let armed = false;
+        try {
+          await cdpEvaluate(tab.id, armExpr, false);
+          armed = true;
+        } catch (_e) {}
+
+        let clickRes;
+        let captured = null;
+        try {
+          clickRes = await sendToContentScript(tab.id, 'CLICK', {
+            ref: params.ref,
+            selector: params.selector,
+            text: params.text,
+            fast: true
+          });
+          if (armed) {
+            await new Promise((r) => setTimeout(r, 150));
+          }
+        } finally {
+          if (armed) {
+            captured = await cdpEvaluate(tab.id, disarmAndReadExpr, false).catch(() => null);
+          }
+        }
+
+        if (captured?.href) {
+          if (/^blob:|^data:/i.test(captured.href)) {
+            const fetched = await sendToContentScript(tab.id, 'FETCH_RESOURCE_IN_PAGE', {
+              url: captured.href,
+              filename: captured.suggestedFilename || undefined
+            });
+            return {
+              ok: true,
+              result: {
+                tabId: tab.id,
+                capturedUrl: captured.href,
+                suggestedFilename: captured.suggestedFilename || fetched.filename,
+                ...fetched
+              }
+            };
+          }
+          return {
+            ok: true,
+            result: {
+              tabId: tab.id,
+              capturedUrl: captured.href,
+              suggestedFilename: captured.suggestedFilename || null,
+              name: clickRes?.name || null
+            }
+          };
+        }
+
+        return { ok: true, result: { tabId: tab.id, triggeredNativeDownload: true, ...clickRes } };
+      }
+
+      case '_ext_get_cookies_for_url': {
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
+        const targetUrl = params.url || tab.url;
+        const cookieRes = await cdpManageCookies(tab.id, targetUrl, { action: 'get' });
+        let userAgent = '';
+        try {
+          userAgent = await cdpEvaluate(tab.id, 'navigator.userAgent', false);
+        } catch (_e) {}
+        return {
+          ok: true,
+          result: {
+            tabId: tab.id,
+            referer: tab.url || '',
+            userAgent: String(userAgent || ''),
+            cookies: cookieRes?.cookies || []
+          }
+        };
+      }
+
       case 'chrome_read_page': {
-        const tab = await resolveTargetTab(params.tabId);
-        await updateBridgeState({ controlledTabId: tab.id });
-        await addTabToAntigravityGroup(tab.id, tab.windowId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
+        if (!params.agentId) {
+          await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
+          await addTabToAntigravityGroup(tab.id, tab.windowId);
+        }
         let snapshot;
         try {
           snapshot = await sendToContentScript(tab.id, 'READ_PAGE', params);
@@ -940,7 +1910,7 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_get_page_text': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         let res;
         try {
           res = await sendToContentScript(tab.id, 'GET_PAGE_TEXT', params);
@@ -955,14 +1925,14 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_find_elements': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const found = await sendToContentScript(tab.id, 'FIND_ELEMENTS', params);
         await appendActionLog('find_elements', `"${params.query || params.role}" -> ${found.count} matches`);
         return { ok: true, result: { tabId: tab.id, ...found } };
       }
 
       case 'chrome_inspect_element': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const inspected = await sendToContentScript(tab.id, 'INSPECT_ELEMENT', params);
         if (params.includeScreenshot && inspected.rect?.width > 2 && inspected.rect?.height > 2) {
           const fullDataUrl = await captureTabImageDataUrl(tab, 'png');
@@ -987,17 +1957,31 @@ async function handleBridgeRpc(request) {
         } else if (params.urlPattern) {
           const re = new RegExp(params.urlPattern, 'i');
           targets = allTabs.filter((t) => re.test(t.url) || re.test(t.title));
+        } else if (params.agentId) {
+          targets = allTabs.filter((t) => t.ownerAgentId === String(params.agentId) && /^https?:/i.test(t.url));
         } else {
           targets = allTabs.filter((t) => t.inAntigravityGroup && /^https?:/i.test(t.url));
           if (targets.length === 0) {
-            targets = allTabs.filter((t) => /^https?:/i.test(t.url)).slice(0, 6);
+            targets = allTabs.filter((t) => /^https?:/i.test(t.url)).slice(0, 8);
           }
         }
 
+        const mode = params.mode || 'markdown';
         const maxPerTab = params.maxLengthPerTab || 6000;
-        const pages = await Promise.all(
-          targets.slice(0, 10).map(async (t) => {
+        const concurrency = Math.max(1, Math.min(12, Number(params.concurrency) || 6));
+        const started = Date.now();
+
+        const pages = await runPool(targets.slice(0, 12), concurrency, async (t) => {
+          return await tabLocks.withRead(t.tabId, async () => {
             try {
+              if (mode === 'deep') {
+                const deep = await sendToContentScript(t.tabId, 'DEEP_READ', { maxTextLength: maxPerTab, maxElements: 120 });
+                return { tabId: t.tabId, title: t.title, url: t.url, ...deep };
+              }
+              if (mode === 'snapshot') {
+                const snap = await sendToContentScript(t.tabId, 'READ_PAGE', { maxTextLength: maxPerTab, maxElements: 120 });
+                return { tabId: t.tabId, title: t.title, url: t.url, ...snap };
+              }
               const extracted = await sendToContentScript(t.tabId, 'GET_PAGE_TEXT', { maxLength: maxPerTab });
               if (extracted.isPdfEmbed && !extracted.markdown) {
                 extracted.markdown = await extractPdfTextFromUrl(t.url, maxPerTab);
@@ -1015,19 +1999,19 @@ async function handleBridgeRpc(request) {
               }
               return { tabId: t.tabId, title: t.title, url: t.url, error: err.message };
             }
-          })
-        );
+          });
+        });
 
-        await appendActionLog('read_multiple_tabs', `Synthesized ${pages.length} tabs`);
-        return { ok: true, result: { count: pages.length, pages } };
+        await appendActionLog('read_multiple_tabs', `Synthesized ${pages.length} tabs (${mode}) in ${Date.now() - started}ms`);
+        return { ok: true, result: { count: pages.length, mode, durationMs: Date.now() - started, pages } };
       }
 
       case 'chrome_click': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const guard = checkDomainGuardrail(tab.url, method, state);
         if (!guard.allowed) throw new Error(guard.reason);
 
-        await updateBridgeState({ controlledTabId: tab.id });
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         let clickResult;
         if (params.useCdp && typeof params.x === 'number' && typeof params.y === 'number') {
           clickResult = await cdpClick(tab.id, params.x, params.y, params);
@@ -1051,27 +2035,27 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_hover': {
-        const tab = await resolveTargetTab(params.tabId);
-        await updateBridgeState({ controlledTabId: tab.id });
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         const hoverResult = await sendToContentScript(tab.id, 'HOVER', params);
         await appendActionLog('hover', `${hoverResult.name || params.ref || params.selector}`);
         return { ok: true, result: { tabId: tab.id, ...hoverResult } };
       }
 
       case 'chrome_highlight': {
-        const tab = await resolveTargetTab(params.tabId);
-        await updateBridgeState({ controlledTabId: tab.id });
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         const highlightResult = await sendToContentScript(tab.id, 'HIGHLIGHT', params);
         await appendActionLog('highlight', `${highlightResult.name || params.ref || params.selector}`);
         return { ok: true, result: { tabId: tab.id, ...highlightResult } };
       }
 
       case 'chrome_drag_and_drop': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const guard = checkDomainGuardrail(tab.url, method, state);
         if (!guard.allowed) throw new Error(guard.reason);
 
-        await updateBridgeState({ controlledTabId: tab.id });
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         let dragRes;
         if (params.useCdp && typeof params.startX === 'number' && typeof params.endX === 'number') {
           dragRes = await cdpDrag(tab.id, params.startX, params.startY, params.endX, params.endY, params.steps);
@@ -1087,11 +2071,11 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_upload_file': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const guard = checkDomainGuardrail(tab.url, method, state);
         if (!guard.allowed) throw new Error(guard.reason);
 
-        await updateBridgeState({ controlledTabId: tab.id });
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         let upRes;
         if (Array.isArray(params.files) && params.files.length > 0) {
           try {
@@ -1118,11 +2102,11 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_type': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const guard = checkDomainGuardrail(tab.url, method, state);
         if (!guard.allowed) throw new Error(guard.reason);
 
-        await updateBridgeState({ controlledTabId: tab.id });
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         let typeResult;
         if (params.useCdp && !params.ref && !params.selector) {
           typeResult = await cdpInsertText(tab.id, params.text, params.pressEnter);
@@ -1135,11 +2119,11 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_select_option': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const guard = checkDomainGuardrail(tab.url, method, state);
         if (!guard.allowed) throw new Error(guard.reason);
 
-        await updateBridgeState({ controlledTabId: tab.id });
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         const selResult = await sendToContentScript(tab.id, 'SELECT_OPTION', params);
         await appendActionLog('select_option', `${(selResult.labels || selResult.values || []).join(', ')} (${selResult.via})`);
         await maybeRecordGifFrame(tab, `Select ${(selResult.labels || [])[0] || 'option'}`);
@@ -1147,7 +2131,7 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_storage': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const action = params.action || 'get';
         const storageType = params.storageType || 'all';
         if (action !== 'get') {
@@ -1171,7 +2155,7 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_audit_page': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const auditRes = await sendToContentScript(tab.id, 'AUDIT_PAGE', params);
         await appendActionLog(
           'audit_page',
@@ -1181,21 +2165,21 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_emulate': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const emuRes = await cdpEmulate(tab.id, params);
         await appendActionLog('emulate', emuRes.reset ? 'Reset emulation' : JSON.stringify(emuRes.applied));
         return { ok: true, result: { tabId: tab.id, ...emuRes } };
       }
 
       case 'chrome_extract_data': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const extRes = await sendToContentScript(tab.id, 'EXTRACT_DATA', params);
         await appendActionLog('extract_data', `Mode=${params.mode || 'auto'} on ${tab.title || tab.url}`);
         return { ok: true, result: { tabId: tab.id, ...extRes } };
       }
 
       case 'chrome_save_pdf': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const pdfRes = await cdpPrintToPdf(tab.id, params);
         await appendActionLog('save_pdf', `Exported PDF from ${tab.title || tab.url}`);
         return { ok: true, result: { tabId: tab.id, url: tab.url, title: tab.title, ...pdfRes } };
@@ -1203,7 +2187,7 @@ async function handleBridgeRpc(request) {
 
       case 'chrome_macro_recorder': {
         const action = params.action || 'status';
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const sess = await chrome.storage.session.get('macroSession');
         const current = sess?.macroSession || { active: false, startUrl: tab.url, tabId: tab.id, steps: [] };
 
@@ -1289,7 +2273,7 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_watch_page': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const action = params.action || 'check';
         const watchKey = `${tab.id}::${params.selector || params.ref || 'body'}`;
         const sess = await chrome.storage.session.get('watchBaselines');
@@ -1339,11 +2323,11 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_fill_form': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const guard = checkDomainGuardrail(tab.url, method, state);
         if (!guard.allowed) throw new Error(guard.reason);
 
-        await updateBridgeState({ controlledTabId: tab.id });
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         const fillResult = await sendToContentScript(tab.id, 'FILL_FORM', params);
         await appendActionLog('fill_form', `Filled ${fillResult.filledCount} fields`);
         await maybeRecordGifFrame(tab, `Fill ${fillResult.filledCount} form fields`);
@@ -1351,11 +2335,11 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_press_key': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const guard = checkDomainGuardrail(tab.url, method, state);
         if (!guard.allowed) throw new Error(guard.reason);
 
-        await updateBridgeState({ controlledTabId: tab.id });
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         const keyResult = params.useCdp
           ? await cdpPressKey(tab.id, params.key)
           : await sendToContentScript(tab.id, 'PRESS_KEY', params);
@@ -1364,8 +2348,8 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_scroll': {
-        const tab = await resolveTargetTab(params.tabId);
-        await updateBridgeState({ controlledTabId: tab.id });
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         let scrollResult;
         if (params.useCdp) {
           const amt = Number(params.amount) || 500;
@@ -1382,28 +2366,28 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_wait_for': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const waitResult = await sendToContentScript(tab.id, 'WAIT_FOR', params);
         return { ok: true, result: { tabId: tab.id, ...waitResult } };
       }
 
       case 'chrome_handle_dialog': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const dlgRes = await cdpHandleDialog(tab.id, params);
         await appendActionLog('handle_dialog', `${params.accept !== false ? 'Accepted' : 'Dismissed'} JS dialog`);
         return { ok: true, result: { tabId: tab.id, ...dlgRes } };
       }
 
       case 'chrome_resize_viewport': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const vpRes = await cdpResizeViewport(tab.id, params);
         await appendActionLog('resize_viewport', vpRes.reset ? 'Reset viewport' : `${vpRes.width}x${vpRes.height}`);
         return { ok: true, result: { tabId: tab.id, ...vpRes } };
       }
 
       case 'chrome_screenshot': {
-        const tab = await resolveTargetTab(params.tabId);
-        await updateBridgeState({ controlledTabId: tab.id });
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
 
         let somMetadata = null;
         if (params.annotateElements) {
@@ -1472,7 +2456,7 @@ async function handleBridgeRpc(request) {
 
       case 'chrome_gif_recorder': {
         const action = params.action || 'status';
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const sess = await chrome.storage.session.get('gifRecording');
         const current = sess?.gifRecording || { active: false, frames: [] };
 
@@ -1539,11 +2523,11 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_evaluate': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         const guard = checkDomainGuardrail(tab.url, method, state);
         if (!guard.allowed) throw new Error(guard.reason);
 
-        await updateBridgeState({ controlledTabId: tab.id });
+        if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         const expression = params.expression || params.script;
         if (!expression) throw new Error('Parameter "expression" is required.');
 
@@ -1553,7 +2537,7 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_get_console_logs': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         let contentLogs = [];
         try {
           const res = await sendToContentScript(tab.id, 'GET_CONSOLE_LOGS', params);
@@ -1580,7 +2564,7 @@ async function handleBridgeRpc(request) {
       }
 
       case 'chrome_get_network_logs': {
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
         let perfRequests = [];
         try {
           const res = await sendToContentScript(tab.id, 'GET_NETWORK_LOGS', params);
@@ -1619,12 +2603,12 @@ async function handleBridgeRpc(request) {
 
       case 'chrome_manage_tabs': {
         const action = params.action || 'activate';
-        const tab = await resolveTargetTab(params.tabId);
+        const tab = await resolveTargetTab(params.tabId, params.agentId);
 
         if (action === 'activate') {
           await chrome.tabs.update(tab.id, { active: true });
           await chrome.windows.update(tab.windowId, { focused: true });
-          await updateBridgeState({ controlledTabId: tab.id });
+          if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
         } else if (action === 'close') {
           await detachDebugger(tab.id);
           await chrome.tabs.remove(tab.id);
@@ -1698,23 +2682,26 @@ async function sendPromptToAntigravity(payload) {
     }
   }
 
-  // Gather any @mentioned tabs
+  // Gather any @mentioned tabs in parallel (v2.2.0)
   const extraTabsContext = [];
   if (Array.isArray(payload.mentionedTabIds) && payload.mentionedTabIds.length > 0) {
-    for (const mTabId of payload.mentionedTabIds.slice(0, 5)) {
-      try {
+    const gathered = await Promise.allSettled(
+      payload.mentionedTabIds.slice(0, 6).map(async (mTabId) => {
         const mTab = await chrome.tabs.get(Number(mTabId));
         const md = await sendToContentScript(mTab.id, 'GET_PAGE_TEXT', { maxLength: 4500 });
         if (md.isPdfEmbed && !md.markdown) {
           md.markdown = await extractPdfTextFromUrl(mTab.url, 4500);
         }
-        extraTabsContext.push({
+        return {
           tabId: mTab.id,
           title: mTab.title,
           url: mTab.url,
           markdown: md.markdown || ''
-        });
-      } catch (_e) {}
+        };
+      })
+    );
+    for (const g of gathered) {
+      if (g.status === 'fulfilled' && g.value) extraTabsContext.push(g.value);
     }
   }
 
@@ -1999,7 +2986,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
           if (tab?.id) {
             await addTabToAntigravityGroup(tab.id, tab.windowId);
-            await updateBridgeState({ controlledTabId: tab.id });
+            if (!params.agentId) await updateBridgeState({ controlledTabId: tab.id }, { silent: true });
           }
           sendResponse({ ok: true, tabId: tab?.id || null });
           break;

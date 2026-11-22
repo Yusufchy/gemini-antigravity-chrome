@@ -66,8 +66,11 @@
     </div>
   </header>
 
+  <!-- Centralized Screen-Reader Live Announcer (kept outside inert shell) -->
+  <div id="sr-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
   <!-- Supervised Domain Approval Prompt (hidden unless needed) -->
-  <div id="domain-approval-bar" class="approval-bar" hidden>
+  <div id="domain-approval-bar" class="approval-bar" role="alert" hidden>
     <span id="domain-approval-text" class="approval-text">Allow actions on domain?</span>
     <div class="approval-actions">
       <button id="domain-allow-btn" class="mini-btn primary" type="button">Allow</button>
@@ -76,7 +79,7 @@
   </div>
 
   <!-- Slide-over Drawer: Shortcuts, Macro Recorder & Scheduled Tasks -->
-  <section id="workflows-drawer" class="drawer" aria-label="Shortcuts, Macros and Schedules" hidden>
+  <section id="workflows-drawer" class="drawer" role="dialog" aria-modal="true" aria-label="Shortcuts, Macros and Schedules" tabindex="-1" hidden>
     <div class="drawer-header">
       <span class="drawer-title">Workflows, Macros &amp; Schedules</span>
       <button id="close-workflows-btn" class="icon-btn" type="button" aria-label="Close drawer" title="Close">
@@ -124,9 +127,9 @@
   </section>
 
   <!-- Slide-over Drawer: How to Use Guide -->
-  <section id="guide-drawer" class="drawer" aria-label="How to use guide" hidden>
+  <section id="guide-drawer" class="drawer" role="dialog" aria-modal="true" aria-label="How to use guide" tabindex="-1" hidden>
     <div class="drawer-header">
-      <span class="drawer-title">How to Use Antigravity v2.1</span>
+      <span class="drawer-title">How to Use Antigravity v2.2</span>
       <button id="close-guide-btn" class="icon-btn" type="button" aria-label="Close guide" title="Close">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
           <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
@@ -135,30 +138,30 @@
     </div>
     <div class="drawer-body">
       <div class="section-block">
-        <div class="section-label">1. Quick Start &amp; Instant Audit</div>
-        <p class="guide-copy">Click the toolbar icon or press <code>Alt+Shift+A</code> to open this panel. Click the top <strong>Pulse</strong> icon for an instant 100ms Core Web Vitals, WCAG 2.2 AA contrast, and SEO audit.</p>
+        <div class="section-label">1. Local Project Download Sync &amp; Tracking</div>
+        <p class="guide-copy">Use <code>chrome_download_file</code> and <code>chrome_track_downloads</code> to download any file, blob, or button export directly into your local project folder with SHA-256 verification and instant JSON/CSV/PDF/ZIP/image parsing.</p>
       </div>
       <div class="section-block">
-        <div class="section-label">2. Multi-Tab &amp; PDF Synthesis (<code>@</code>)</div>
-        <p class="guide-copy">Type <code>@</code> in the prompt bar to attach open tabs or PDF documents so Antigravity can compare and synthesize data across tabs simultaneously.</p>
+        <div class="section-label">2. Cooperative Multi-Agent Swarms &amp; DAG Planning</div>
+        <p class="guide-copy">Assign specialist roles (<code>planner</code>, <code>researcher</code>, <code>operator</code>, <code>downloader</code>, <code>auditor</code>) via <code>chrome_swarm_plan</code>, <code>chrome_swarm_blackboard</code>, <code>chrome_agent_session</code>, and <code>chrome_parallel_run</code> to work simultaneously across color-coded tabs with Per-Tab Fair RWLocks.</p>
       </div>
       <div class="section-block">
-        <div class="section-label">3. Pick Element &amp; Region Snip</div>
-        <p class="guide-copy">Use <strong>Crosshair</strong> (<code>Alt+Shift+X</code>) to attach any element's DOM selector, Playwright locator, and computed CSS, or <strong>Crop</strong> to capture a screen region.</p>
+        <div class="section-label">3. Hyper-Speed Deep Read &amp; Batch Actions</div>
+        <p class="guide-copy"><code>chrome_deep_read</code> captures full DOM refs, Markdown, tables, downloadable assets, and console/network errors in 1 call (with FNV-1a delta diffing). <code>chrome_batch_actions</code> runs multi-step workflows in a single round-trip.</p>
       </div>
       <div class="section-block">
-        <div class="section-label">4. Macro Recorder &amp; Playwright Codegen</div>
-        <p class="guide-copy">Open the <strong>Clock</strong> drawer and click <strong>Record Macro</strong> to record your own clicks, inputs, and selects—replay them anytime or export a ready-to-run Playwright <code>.spec.ts</code> test.</p>
+        <div class="section-label">4. Instant Audit, Macro Codegen &amp; Multi-Tab (<code>@</code>)</div>
+        <p class="guide-copy">Click <strong>Pulse</strong> for a 100ms CWV/WCAG 2.2/SEO audit, type <code>@</code> to synthesize open tabs/PDFs, press <code>Alt+Shift+X</code> to pick elements, or record Playwright <code>.spec.ts</code> tests from the Clock drawer.</p>
       </div>
       <div class="section-block">
-        <div class="section-label">5. 34 Autonomous MCP Tools &amp; Guardrails</div>
-        <p class="guide-copy">Includes dropdown/ARIA combobox selection, HTTP-only cookie &amp; storage inspection, dark-mode/network/geo emulation, vector PDF export, GIF recording, and <code>Auto</code> / <code>Ask</code> safety modes.</p>
+        <div class="section-label">5. 42 Autonomous MCP Tools &amp; Guardrails</div>
+        <p class="guide-copy">100% local bridge over <code>127.0.0.1</code> with <code>Auto</code> / <code>Ask</code> safety modes, domain allow/block guardrails, and instant pause (<code>Alt+Shift+P</code>).</p>
       </div>
     </div>
   </section>
 
   <!-- Slide-over Drawer: Settings, Guardrails & Activity Log -->
-  <section id="settings-drawer" class="drawer" aria-label="Control and guardrails" hidden>
+  <section id="settings-drawer" class="drawer" role="dialog" aria-modal="true" aria-label="Control and guardrails" tabindex="-1" hidden>
     <div class="drawer-header">
       <span class="drawer-title">Control &amp; Guardrails</span>
       <button id="close-settings-btn" class="icon-btn" type="button" aria-label="Close settings" title="Close">
@@ -202,6 +205,14 @@
         <div class="kv-row">
           <span>Tab Group</span>
           <button id="attach-tab-group-btn" class="mini-btn" type="button">Group Active Tab</button>
+        </div>
+        <div class="kv-row">
+          <span>Multi-Agent Swarm</span>
+          <code id="active-agents-label">0 active</code>
+        </div>
+        <div class="kv-row">
+          <span>Project Downloads</span>
+          <code id="downloads-status-label">0 tracked</code>
         </div>
       </div>
 

@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.Yusufchy/gemini-antigravity-chrome",
   "title": "Gemini Antigravity in Chrome",
-  "description": "100% local 34-tool MCP browser automation bridge connecting Google Antigravity IDE (v2.33+) & Gemini CLI directly to your signed-in Google Chrome browser with Shadow DOM inspection, CWV/WCAG 2.2 audits, CDP emulation, and Playwright codegen.",
-  "version": "2.1.0",
+  "description": "100% local 42-tool MCP browser automation & cooperative multi-agent DAG swarm bridge connecting Google Antigravity IDE & Gemini CLI to your signed-in Google Chrome browser with local project download sync, SHA-256 verification, FNV-1a deep-read, pipelined batches, CWV/WCAG 2.2 audits, and Playwright codegen.",
+  "version": "2.2.0",
   "websiteUrl": "https://extensions.vionixai.tech/gemini-antigravity/",
   "repository": {
     "url": "https://github.com/Yusufchy/gemini-antigravity-chrome",

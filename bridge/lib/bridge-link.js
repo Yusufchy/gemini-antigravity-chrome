@@ -1,6 +1,7 @@
 /**
- * BridgeLink — gives any bridge process (MCP server, native host) a `call(method, params)`
- * that reaches the Chrome extension, regardless of which process owns the hub.
+ * BridgeLink (v2.2.0) — gives any bridge process (MCP server, native host, parallel agent)
+ * a unified `call(method, params)` routed through BridgeHub.executeTool so both in-process
+ * hubs and multi-agent WebSocket clients share identical DownloadManager & AgentScheduler routing.
  *
  *   1. Try to bind the hub port -> this process becomes the hub (in-process calls).
  *   2. If the port is taken     -> connect to the existing hub as an authenticated client.
@@ -15,8 +16,9 @@ const { WS_PORT, getBridgeToken } = require('./config');
 const log = (...args) => process.stderr.write(`[agy-chrome-link] ${args.join(' ')}\n`);
 
 class BridgeLink {
-  constructor({ port = WS_PORT } = {}) {
+  constructor({ port = WS_PORT, clientId } = {}) {
     this.port = port;
+    this.clientId = clientId || `mcp-${process.pid}-${Math.random().toString(36).slice(2, 6)}`;
     this.hub = null;
     this.ws = null;
     this.pending = new Map();
@@ -41,19 +43,21 @@ class BridgeLink {
   async _elect() {
     try {
       this.hub = await new BridgeHub({ port: this.port }).start();
-      log('acting as hub');
+      log(`acting as hub (${this.clientId})`);
       return;
     } catch (err) {
       if (err.code !== 'EADDRINUSE') throw err;
     }
     await this._connectClient();
-    log('connected to existing hub as client');
+    log(`connected to existing hub as client (${this.clientId})`);
   }
 
   _connectClient() {
     const token = getBridgeToken();
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${this.port}/ws?client=bridge-client&token=${token}`);
+      const ws = new WebSocket(
+        `ws://127.0.0.1:${this.port}/ws?client=bridge-client&token=${token}&clientId=${encodeURIComponent(this.clientId)}`
+      );
       const timer = setTimeout(() => {
         try {
           ws.close();
@@ -98,17 +102,32 @@ class BridgeLink {
 
   async call(method, params = {}, timeoutMs = 60000) {
     await this.ensure();
-    if (this.hub) return this.hub.callExtension(method, params, timeoutMs);
+    if (this.hub) {
+      return this.hub.executeTool(method, params, timeoutMs, { clientId: this.clientId });
+    }
 
     const id = `c-${process.pid}-${++this.seq}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Bridge hub did not answer ${method} within ${timeoutMs + 25000}ms`));
-      }, timeoutMs + 25000); // hub may spend up to ~20s waking Chrome
+      }, timeoutMs + 25000);
       this.pending.set(id, { resolve, reject, timer });
       this.ws.send(JSON.stringify({ type: 'RPC_REQUEST', id, method, params, timeoutMs }));
     });
+  }
+
+  close() {
+    if (this.hub) {
+      this.hub.stop();
+      this.hub = null;
+    }
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch (_e) {}
+      this.ws = null;
+    }
   }
 }
 

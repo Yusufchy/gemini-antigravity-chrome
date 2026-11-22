@@ -1,7 +1,7 @@
 {
   "name": "gemini-antigravity-chrome",
-  "version": "2.1.0",
-  "description": "34-tool local Model Context Protocol (MCP) Chrome extension & CDP 1.3 browser automation bridge for Google Antigravity IDE (v2.33+) & Gemini CLI.",
+  "version": "2.2.0",
+  "description": "42-tool local Model Context Protocol (MCP) Chrome extension & multi-agent DAG swarm bridge with local project download sync & hyper-speed deep-read for Google Antigravity IDE & Gemini CLI.",
   "license": "MIT",
   "author": "VionixAI <https://vionixai.tech/>",
   "homepage": "https://extensions.vionixai.tech/gemini-antigravity/",

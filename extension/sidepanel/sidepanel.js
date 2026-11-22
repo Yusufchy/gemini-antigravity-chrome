@@ -46,6 +46,9 @@ const addScheduleForm = document.getElementById('add-schedule-form');
 const settingsDrawer = document.getElementById('settings-drawer');
 const closeSettingsBtn = document.getElementById('close-settings-btn');
 const bridgeEndpointLabel = document.getElementById('bridge-endpoint-label');
+const activeAgentsLabel = document.getElementById('active-agents-label');
+const downloadsStatusLabel = document.getElementById('downloads-status-label');
+const srAnnouncer = document.getElementById('sr-announcer');
 const reconnectBtn = document.getElementById('reconnect-btn');
 const modeAutoBtn = document.getElementById('mode-auto-btn');
 const modeAskBtn = document.getElementById('mode-ask-btn');
@@ -462,57 +465,77 @@ gifBtn.addEventListener('click', async () => {
   }
 });
 
-// --- Drawers, Inert Shell & Settings ---
+// --- Drawers, Inert Shell, Focus Management & Settings (WCAG 2.2 AA) ---
+let lastDrawerOpener = null;
+
+function announceStatus(message) {
+  if (!srAnnouncer) return;
+  srAnnouncer.textContent = '';
+  setTimeout(() => {
+    srAnnouncer.textContent = String(message || '');
+  }, 30);
+}
+
 function setShellInert(drawerOpen) {
   messagesContainer.inert = Boolean(drawerOpen);
   if (composerShell) composerShell.inert = Boolean(drawerOpen);
 }
 
-function toggleDrawer(targetDrawer) {
-  const isHidden = targetDrawer.hidden;
+function closeAllDrawers(restoreFocus = true) {
   workflowsDrawer.hidden = true;
   settingsDrawer.hidden = true;
   if (guideDrawer) guideDrawer.hidden = true;
   workflowsBtn.classList.remove('active');
   settingsBtn.classList.remove('active');
   if (guideBtn) guideBtn.classList.remove('active');
+  setShellInert(false);
+  if (restoreFocus && lastDrawerOpener && typeof lastDrawerOpener.focus === 'function') {
+    lastDrawerOpener.focus();
+    lastDrawerOpener = null;
+  }
+}
+
+function toggleDrawer(targetDrawer, openerBtn = null) {
+  const isHidden = targetDrawer.hidden;
+  closeAllDrawers(false);
 
   if (isHidden) {
+    lastDrawerOpener = openerBtn || document.activeElement;
     targetDrawer.hidden = false;
     setShellInert(true);
     if (targetDrawer === workflowsDrawer) workflowsBtn.classList.add('active');
     if (targetDrawer === settingsDrawer) settingsBtn.classList.add('active');
     if (targetDrawer === guideDrawer && guideBtn) guideBtn.classList.add('active');
+    const firstFocus = targetDrawer.querySelector('button, input, textarea, [tabindex="0"]') || targetDrawer;
+    firstFocus.focus();
   } else {
-    setShellInert(false);
+    if (lastDrawerOpener && typeof lastDrawerOpener.focus === 'function') {
+      lastDrawerOpener.focus();
+      lastDrawerOpener = null;
+    }
   }
 }
 
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && (!workflowsDrawer.hidden || !settingsDrawer.hidden || (guideDrawer && !guideDrawer.hidden))) {
+    e.preventDefault();
+    closeAllDrawers(true);
+  }
+});
+
 if (guideBtn && guideDrawer) {
-  guideBtn.addEventListener('click', () => toggleDrawer(guideDrawer));
+  guideBtn.addEventListener('click', () => toggleDrawer(guideDrawer, guideBtn));
 }
 if (closeGuideBtn && guideDrawer) {
-  closeGuideBtn.addEventListener('click', () => {
-    guideDrawer.hidden = true;
-    guideBtn?.classList.remove('active');
-    setShellInert(false);
-  });
+  closeGuideBtn.addEventListener('click', () => closeAllDrawers(true));
 }
 
-workflowsBtn.addEventListener('click', () => toggleDrawer(workflowsDrawer));
-closeWorkflowsBtn.addEventListener('click', () => {
-  workflowsDrawer.hidden = true;
-  workflowsBtn.classList.remove('active');
-  setShellInert(false);
-});
+workflowsBtn.addEventListener('click', () => toggleDrawer(workflowsDrawer, workflowsBtn));
+closeWorkflowsBtn.addEventListener('click', () => closeAllDrawers(true));
 
-settingsBtn.addEventListener('click', () => toggleDrawer(settingsDrawer));
-statusTrigger.addEventListener('click', () => toggleDrawer(settingsDrawer));
-closeSettingsBtn.addEventListener('click', () => {
-  settingsDrawer.hidden = true;
-  settingsBtn.classList.remove('active');
-  setShellInert(false);
-});
+settingsBtn.addEventListener('click', () => toggleDrawer(settingsDrawer, settingsBtn));
+statusTrigger.addEventListener('click', () => toggleDrawer(settingsDrawer, statusTrigger));
+closeSettingsBtn.addEventListener('click', () => closeAllDrawers(true));
 
 // Instant 100ms Core Web Vitals + WCAG 2.2 + SEO Audit
 async function runInstantAudit() {
@@ -800,6 +823,21 @@ function syncStateUi() {
   modeAskBtn.classList.toggle('active', isAsk);
 
   bridgeEndpointLabel.textContent = `127.0.0.1:${currentState.bridgePort || 17380}`;
+  if (activeAgentsLabel) {
+    const cnt = Number(currentState.activeAgentCount) || 0;
+    activeAgentsLabel.textContent = `${cnt} active`;
+  }
+  if (downloadsStatusLabel) {
+    const dl = currentState.downloadsSummary;
+    if (dl) {
+      downloadsStatusLabel.textContent = dl.watchEnabled
+        ? `${dl.trackedCount || 0} tracked · Auto-sync`
+        : `${dl.trackedCount || 0} tracked`;
+      downloadsStatusLabel.title = dl.watchProjectDir ? `Watching: ${dl.watchProjectDir}` : 'Project download sync ready';
+    } else {
+      downloadsStatusLabel.textContent = '0 tracked';
+    }
+  }
   applyTheme(currentState.themePreference);
 
   if (document.activeElement !== allowDomainsInput) {

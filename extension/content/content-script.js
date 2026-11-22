@@ -12,9 +12,10 @@
  */
 
 (() => {
-  if (globalThis.__AGY_CONTENT_SCRIPT_V2_1__) {
+  if (globalThis.__AGY_CONTENT_SCRIPT_V2_2__) {
     return;
   }
+  globalThis.__AGY_CONTENT_SCRIPT_V2_2__ = true;
   globalThis.__AGY_CONTENT_SCRIPT_V2_1__ = true;
 
   const refMap = new Map(); // refId -> { ref: WeakRef<Element>, offsetX: number, offsetY: number }
@@ -220,7 +221,15 @@
     });
   }
 
-  async function animateAgentAction(targetEl, x, y, label, isClick = false) {
+  async function animateAgentAction(targetEl, x, y, label, isClick = false, fast = false) {
+    if (fast || document.hidden) {
+      if (typeof x === 'number' && typeof y === 'number') {
+        lastCursorX = x;
+        lastCursorY = y;
+      }
+      if (!document.hidden && label) showHudStatus(label, 1800);
+      return;
+    }
     const hud = ensureHud();
     if (!hud) return;
     showHudStatus(label || 'Acting on page...', 3800);
@@ -733,6 +742,17 @@
         return;
       }
 
+      // Emit leaf text blocks inside modern React/Tailwind <div>, <section>, <output>, <span>, <dd>, <dt>, etc.
+      const BLOCK_TAGS = new Set(['DIV', 'SECTION', 'ARTICLE', 'MAIN', 'HEADER', 'FORM', 'UL', 'OL', 'TABLE', 'PRE', 'P', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'TR', 'FIELDSET']);
+      const hasStructuralChild = Array.from(el.children).some((ch) => BLOCK_TAGS.has(ch.tagName));
+      if (!hasStructuralChild && !['BUTTON', 'SELECT', 'OPTION', 'INPUT', 'TEXTAREA'].includes(tag)) {
+        const txt = (el.innerText || '').replace(/\s+/g, ' ').trim();
+        if (txt) {
+          lines.push(txt);
+          return;
+        }
+      }
+
       for (const child of el.children) {
         walk(child);
       }
@@ -1036,9 +1056,10 @@
     let clickX = params.x;
     let clickY = params.y;
 
+    const fastMode = Boolean(params.fast || document.hidden);
     if (el) {
       el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
-      await new Promise((r) => setTimeout(r, 40));
+      if (!fastMode) await new Promise((r) => setTimeout(r, 30));
       const rect = el.getBoundingClientRect();
       clickX = Math.round(rect.left + (resolved?.offsetX || 0) + rect.width / 2);
       clickY = Math.round(rect.top + (resolved?.offsetY || 0) + rect.height / 2);
@@ -1046,7 +1067,7 @@
 
     const targetEl = el || document.elementFromPoint(clickX, clickY) || document.body;
     const label = getAccessibleName(targetEl) || targetEl.tagName.toLowerCase();
-    await animateAgentAction(targetEl, clickX, clickY, `Click "${label.slice(0, 40)}"`, true);
+    await animateAgentAction(targetEl, clickX, clickY, `Click "${label.slice(0, 40)}"`, true, fastMode);
 
     const buttonMap = { left: 0, middle: 1, right: 2 };
     const button = buttonMap[params.button || 'left'] ?? 0;
@@ -1101,9 +1122,10 @@
     let hX = Number(params.x);
     let hY = Number(params.y);
 
+    const fastMode = Boolean(params.fast || document.hidden);
     if (el) {
       el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
-      await new Promise((r) => setTimeout(r, 40));
+      if (!fastMode) await new Promise((r) => setTimeout(r, 30));
       const rect = el.getBoundingClientRect();
       hX = Math.round(rect.left + (resolved?.offsetX || 0) + rect.width / 2);
       hY = Math.round(rect.top + (resolved?.offsetY || 0) + rect.height / 2);
@@ -1111,7 +1133,7 @@
 
     const targetEl = el || document.elementFromPoint(hX, hY) || document.body;
     const label = params.label || getAccessibleName(targetEl) || targetEl.tagName.toLowerCase();
-    await animateAgentAction(targetEl, hX, hY, `Hover "${label.slice(0, 42)}"`, false);
+    await animateAgentAction(targetEl, hX, hY, `Hover "${label.slice(0, 42)}"`, false, fastMode);
 
     const eventInit = {
       bubbles: true,
@@ -1125,8 +1147,8 @@
     targetEl.dispatchEvent(new MouseEvent('mousemove', eventInit));
     targetEl.dispatchEvent(new MouseEvent('mouseenter', eventInit));
 
-    const dwellMs = Math.min(Number(params.dwellMs) || 400, 4000);
-    await new Promise((r) => setTimeout(r, dwellMs));
+    const dwellMs = fastMode ? Math.min(Number(params.dwellMs) || 30, 500) : Math.min(Number(params.dwellMs) || 400, 4000);
+    if (dwellMs > 0) await new Promise((r) => setTimeout(r, dwellMs));
 
     return {
       hovered: true,
@@ -1319,15 +1341,18 @@
       throw new Error(`Editable element not found for ${JSON.stringify({ ref: params.ref, selector: params.selector })}`);
     }
 
+    const fastMode = Boolean(params.fast || document.hidden);
     el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
-    await new Promise((r) => setTimeout(r, 30));
+    if (!fastMode) await new Promise((r) => setTimeout(r, 25));
     const rect = el.getBoundingClientRect();
     const label = getAccessibleName(el) || el.tagName.toLowerCase();
     animateAgentAction(
       el,
       rect.left + (resolved?.offsetX || 0) + rect.width / 2,
       rect.top + (resolved?.offsetY || 0) + rect.height / 2,
-      `Type into "${label.slice(0, 35)}"`
+      `Type into "${label.slice(0, 35)}"`,
+      false,
+      fastMode
     );
 
     el.focus({ preventScroll: true });
@@ -1463,7 +1488,9 @@
       window.scrollBy({ left: dx, top: dy, behavior: 'instant' });
     }
 
-    await new Promise((r) => setTimeout(r, 60));
+    if (!params.fast && !document.hidden) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
     return {
       scrolled: true,
       direction,
@@ -1707,15 +1734,18 @@
       throw new Error(`Dropdown element not found for ${JSON.stringify({ ref: params.ref, selector: params.selector, text: params.text })}`);
     }
 
+    const fastMode = Boolean(params.fast || document.hidden);
     el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
-    await new Promise((r) => setTimeout(r, 30));
+    if (!fastMode) await new Promise((r) => setTimeout(r, 25));
     const rect = el.getBoundingClientRect();
     const label = getAccessibleName(el) || el.tagName.toLowerCase();
     await animateAgentAction(
       el,
       Math.round(rect.left + (resolved?.offsetX || 0) + rect.width / 2),
       Math.round(rect.top + (resolved?.offsetY || 0) + rect.height / 2),
-      `Select "${label.slice(0, 35)}"`
+      `Select "${label.slice(0, 35)}"`,
+      false,
+      fastMode
     );
 
     const targets = Array.isArray(params.values) && params.values.length > 0
@@ -2329,6 +2359,377 @@
     return { macroRecording: macroRecordingActive };
   }
 
+  // --- v2.2.0: FNV-1a Hash, Single-Pass Deep Read + Delta Diffing, Downloadable Asset Scanner, DOM Batch & In-Page Blob Fetcher ---
+  let lastDeepState = null;
+
+  function fnv1aHash(str) {
+    let h = 0x811c9dc5;
+    const s = String(str || '');
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16).padStart(8, '0');
+  }
+
+  function scanDownloadableAssets(limit = 60) {
+    const FILE_EXT_RE = /\.(pdf|csv|tsv|xlsx?|docx?|pptx?|zip|tar|gz|tgz|7z|rar|json|jsonl|xml|txt|md|png|jpe?g|webp|gif|svg|mp4|webm|mp3|wav|m4a|exe|msi|dmg|pkg|deb|apk)(\?|#|$)/i;
+    const seen = new Set();
+    const assets = [];
+
+    function pushAsset(url, kind, label, suggestedName, ref = null) {
+      if (!url || seen.has(url) || assets.length >= limit) return;
+      if (/^javascript:|^mailto:|^tel:|^#/i.test(url)) return;
+      seen.add(url);
+      assets.push({
+        url,
+        kind,
+        label: String(label || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+        suggestedName: suggestedName || null,
+        ref
+      });
+    }
+
+    document.querySelectorAll('a[href]').forEach((a) => {
+      if (assets.length >= limit) return;
+      const href = a.href || '';
+      const hasDownloadAttr = a.hasAttribute('download');
+      const dlAttr = a.getAttribute('download') || null;
+      if (hasDownloadAttr || FILE_EXT_RE.test(href) || /^blob:|^data:/i.test(href)) {
+        pushAsset(
+          href,
+          hasDownloadAttr ? 'download_link' : 'file_link',
+          a.innerText || a.getAttribute('aria-label') || a.title || dlAttr || href,
+          dlAttr || null,
+          a.getAttribute('data-agy-ref') || null
+        );
+      }
+    });
+
+    document.querySelectorAll('video[src], audio[src], source[src], embed[src], object[data]').forEach((el) => {
+      if (assets.length >= limit) return;
+      const src = el.src || el.getAttribute('data') || '';
+      if (src) pushAsset(src, el.tagName.toLowerCase(), el.title || el.getAttribute('aria-label') || el.tagName.toLowerCase(), null);
+    });
+
+    document.querySelectorAll('img[src]').forEach((img) => {
+      if (assets.length >= limit) return;
+      const r = img.getBoundingClientRect();
+      if (r.width >= 160 && r.height >= 120 && img.src && !img.src.startsWith('data:image/svg')) {
+        pushAsset(img.src, 'image', img.alt || 'image', null);
+      }
+    });
+
+    return assets;
+  }
+
+  function scanFormsSummary(limit = 15) {
+    return Array.from(document.querySelectorAll('form'))
+      .slice(0, limit)
+      .map((form, idx) => {
+        const inputs = Array.from(form.querySelectorAll('input, select, textarea'))
+          .filter((el) => el.type !== 'hidden')
+          .slice(0, 30)
+          .map((el) => ({
+            ref: el.getAttribute('data-agy-ref') || null,
+            tag: el.tagName.toLowerCase(),
+            type: el.type || null,
+            name: el.name || el.id || null,
+            label: getAccessibleName(el).slice(0, 80),
+            required: Boolean(el.required)
+          }));
+        return {
+          index: idx,
+          id: form.id || null,
+          action: form.action || null,
+          method: (form.method || 'GET').toUpperCase(),
+          fieldCount: inputs.length,
+          fields: inputs
+        };
+      });
+  }
+
+  function performDeepRead(params = {}) {
+    const started = performance.now();
+    const snapshot = buildPageSnapshot({
+      viewportOnly: Boolean(params.viewportOnly),
+      includeText: true,
+      maxElements: Number(params.maxElements) || 220,
+      maxTextLength: Number(params.maxTextLength) || 18000,
+      maxDepth: Number(params.maxDepth) || 5
+    });
+
+    const includeMarkdown = params.includeMarkdown !== false;
+    const includeStructured = params.includeStructured !== false;
+    const includeAssets = params.includeAssets !== false;
+
+    const markdownObj = includeMarkdown
+      ? extractStructuredMarkdown({ maxLength: Number(params.maxTextLength) || 18000 })
+      : null;
+    const structured = includeStructured ? performExtractData({ mode: 'auto', limit: 60 }) : null;
+    const forms = includeStructured ? scanFormsSummary(12) : [];
+    const downloadableAssets = includeAssets ? scanDownloadableAssets(60) : [];
+
+    const nav = performance.getEntriesByType('navigation')[0] || {};
+    const perfSummary = {
+      ttfbMs: nav.responseStart ? Math.round(nav.responseStart - nav.requestStart) : null,
+      domContentLoadedMs: nav.domContentLoadedEventEnd ? Math.round(nav.domContentLoadedEventEnd) : null,
+      loadMs: nav.loadEventEnd ? Math.round(nav.loadEventEnd) : null,
+      resourceCount: performance.getEntriesByType('resource').length
+    };
+
+    const elementSigMap = new Map();
+    for (const el of snapshot.elements || []) {
+      const sig = `${el.role}|${el.name}|${el.value || ''}|${el.checked ?? ''}|${el.disabled ? 1 : 0}|${el.href || ''}`;
+      elementSigMap.set(el.ref, { sig, el });
+    }
+    const textLines = (markdownObj?.markdown || snapshot.visibleText || '')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const stateHash = fnv1aHash(`${location.href}\n${snapshot.formattedTree}\n${textLines.join('\n')}`);
+
+    const prev = lastDeepState;
+    const canDelta =
+      Boolean(params.deltaOnly) &&
+      prev &&
+      prev.url === location.href &&
+      (!params.sinceHash || params.sinceHash === prev.stateHash);
+
+    const nextState = {
+      url: location.href,
+      stateHash,
+      elementSigMap,
+      textLineSet: new Set(textLines),
+      timestamp: Date.now()
+    };
+    lastDeepState = nextState;
+
+    const contentErrors = consoleLogs.filter((l) => ['error', 'exception'].includes(l.level)).slice(-30);
+
+    if (canDelta) {
+      if (stateHash === prev.stateHash) {
+        return {
+          delta: true,
+          unchanged: true,
+          stateHash,
+          previousHash: prev.stateHash,
+          url: location.href,
+          title: document.title,
+          elementCount: snapshot.elementCount,
+          safetyGates: snapshot.safetyGates,
+          contentConsoleErrors: contentErrors,
+          readDurationMs: Math.round(performance.now() - started)
+        };
+      }
+
+      const addedElements = [];
+      const changedElements = [];
+      const removedRefs = [];
+
+      for (const [ref, cur] of elementSigMap.entries()) {
+        const old = prev.elementSigMap.get(ref);
+        if (!old) addedElements.push(cur.el);
+        else if (old.sig !== cur.sig) changedElements.push(cur.el);
+      }
+      for (const ref of prev.elementSigMap.keys()) {
+        if (!elementSigMap.has(ref)) removedRefs.push(ref);
+      }
+
+      const addedTextLines = textLines.filter((l) => !prev.textLineSet.has(l)).slice(0, 80);
+      const removedTextLines = Array.from(prev.textLineSet).filter((l) => !nextState.textLineSet.has(l)).slice(0, 80);
+
+      return {
+        delta: true,
+        unchanged: false,
+        stateHash,
+        previousHash: prev.stateHash,
+        url: location.href,
+        title: document.title,
+        elementCount: snapshot.elementCount,
+        addedElements: addedElements.slice(0, 60),
+        changedElements: changedElements.slice(0, 60),
+        removedRefs: removedRefs.slice(0, 60),
+        addedTextLines,
+        removedTextLines,
+        downloadableAssets,
+        safetyGates: snapshot.safetyGates,
+        contentConsoleErrors: contentErrors,
+        readDurationMs: Math.round(performance.now() - started)
+      };
+    }
+
+    return {
+      delta: false,
+      unchanged: false,
+      stateHash,
+      url: snapshot.url,
+      title: snapshot.title,
+      isPdfEmbed: snapshot.isPdfEmbed,
+      crossOriginFrameCount: snapshot.crossOriginFrameCount,
+      crossOriginFrames: snapshot.crossOriginFrames,
+      pausedByUser: snapshot.pausedByUser,
+      viewport: snapshot.viewport,
+      safetyGates: snapshot.safetyGates,
+      elementCount: snapshot.elementCount,
+      formattedTree: snapshot.formattedTree,
+      markdown: markdownObj?.markdown || snapshot.visibleText || '',
+      structured: structured
+        ? {
+            tables: structured.tables || [],
+            lists: structured.lists || [],
+            metadata: structured.metadata || {},
+            schemas: structured.schemas || [],
+            forms
+          }
+        : undefined,
+      downloadableAssets,
+      performance: perfSummary,
+      contentConsoleErrors: contentErrors,
+      readDurationMs: Math.round(performance.now() - started)
+    };
+  }
+
+  async function performDomBatch(params = {}) {
+    if (isPausedByUser) {
+      throw new Error('Action blocked: User has paused Antigravity control on this tab.');
+    }
+    const steps = Array.isArray(params.steps) ? params.steps : [];
+    const stopOnError = params.stopOnError !== false;
+    const fastMode = params.fast !== false;
+    const results = [];
+    let stoppedEarly = false;
+    const tStart = performance.now();
+
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i] || {};
+      const action = step.action;
+      const p = { ...(step.params || {}), fast: step.params?.fast ?? fastMode };
+      const s0 = performance.now();
+      try {
+        let res;
+        switch (action) {
+          case 'click':
+            res = await performClick(p);
+            break;
+          case 'type':
+            res = await performType(p);
+            break;
+          case 'select_option':
+            res = await performSelectOption(p);
+            break;
+          case 'fill_form':
+            res = await performFillForm(p);
+            break;
+          case 'press_key':
+            res = await performPressKey(p);
+            break;
+          case 'scroll':
+            res = await performScroll(p);
+            break;
+          case 'hover':
+            res = await performHover(p);
+            break;
+          case 'wait_for':
+            res = await performWaitFor(p);
+            break;
+          case 'extract_data':
+            res = performExtractData(p);
+            break;
+          case 'read_page':
+            res = buildPageSnapshot(p);
+            break;
+          case 'deep_read':
+            res = performDeepRead(p);
+            break;
+          case 'get_page_text':
+            res = extractStructuredMarkdown(p);
+            break;
+          case 'sleep': {
+            const ms = Math.max(0, Math.min(15000, Number(p.ms ?? p.durationMs) || 200));
+            await new Promise((r) => setTimeout(r, ms));
+            res = { sleptMs: ms };
+            break;
+          }
+          default:
+            throw new Error(`Unsupported DOM batch step action: ${action}`);
+        }
+        results.push({ stepIndex: i, action, ok: true, durationMs: Math.round(performance.now() - s0), result: res });
+      } catch (err) {
+        results.push({ stepIndex: i, action, ok: false, durationMs: Math.round(performance.now() - s0), error: err?.message || String(err) });
+        if (stopOnError) {
+          stoppedEarly = true;
+          break;
+        }
+      }
+    }
+
+    return {
+      executedSteps: results.length,
+      stoppedEarly,
+      durationMs: Math.round(performance.now() - tStart),
+      results
+    };
+  }
+
+  function bytesToBase64Chunked(bytes) {
+    const CHUNK = 0x8000;
+    const parts = [];
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK)));
+    }
+    return btoa(parts.join(''));
+  }
+
+  async function fetchResourceInPage(params = {}) {
+    const url = String(params.url || '').trim();
+    if (!url) throw new Error('Parameter "url" is required.');
+
+    if (url.startsWith('data:')) {
+      const m = url.match(/^data:([^;,]+)?(?:;charset=[^;,]+)?(;base64)?,([\s\S]*)$/i);
+      if (!m) throw new Error('Malformed data: URL.');
+      const mimeType = m[1] || 'application/octet-stream';
+      const isB64 = Boolean(m[2]);
+      const payload = m[3] || '';
+      const base64 = isB64 ? payload : bytesToBase64Chunked(new TextEncoder().encode(decodeURIComponent(payload)));
+      return {
+        base64,
+        mimeType,
+        filename: params.filename || null,
+        sizeBytes: Math.floor((base64.length * 3) / 4)
+      };
+    }
+
+    const resp = await fetch(url, { credentials: 'include' });
+    if (!resp.ok) {
+      throw new Error(`In-page fetch failed with HTTP ${resp.status} ${resp.statusText}`);
+    }
+    const buf = await resp.arrayBuffer();
+    if (buf.byteLength > 36 * 1024 * 1024) {
+      throw new Error(`Resource exceeds 36 MB in-page transfer cap (${buf.byteLength} bytes); use strategy="node_stream".`);
+    }
+    const mimeType = (resp.headers.get('content-type') || '').split(';')[0].trim().toLowerCase() || 'application/octet-stream';
+    const cd = resp.headers.get('content-disposition') || '';
+    let filename = params.filename || null;
+    if (!filename && cd) {
+      const m = cd.match(/filename\*?=(?:UTF-8''|utf-8'')?["']?([^"';\r\n]+)["']?/i);
+      if (m) {
+        try {
+          filename = decodeURIComponent(m[1]);
+        } catch (_e) {
+          filename = m[1];
+        }
+      }
+    }
+    const bytes = new Uint8Array(buf);
+    return {
+      base64: bytesToBase64Chunked(bytes),
+      mimeType,
+      filename,
+      sizeBytes: bytes.byteLength
+    };
+  }
+
   // --- Message Listener ---
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     (async () => {
@@ -2342,6 +2743,35 @@
             showHudStatus('Reading page...', 2000);
             sendResponse({ ok: true, result: buildPageSnapshot(message.params || {}) });
             break;
+
+          case 'DEEP_READ':
+            sendResponse({ ok: true, result: performDeepRead(message.params || {}) });
+            break;
+
+          case 'RUN_DOM_BATCH':
+            sendResponse({ ok: true, result: await performDomBatch(message.params || {}) });
+            break;
+
+          case 'FETCH_RESOURCE_IN_PAGE':
+            sendResponse({ ok: true, result: await fetchResourceInPage(message.params || {}) });
+            break;
+
+          case 'INSPECT_DOWNLOAD_LINK': {
+            const el = resolveElement(message.params || {});
+            const a = el?.tagName === 'A' ? el : el?.closest?.('a[href]');
+            sendResponse({
+              ok: true,
+              result: a
+                ? {
+                    href: a.href || '',
+                    hasDownloadAttr: a.hasAttribute('download'),
+                    suggestedFilename: a.getAttribute('download') || null,
+                    name: getAccessibleName(a)
+                  }
+                : null
+            });
+            break;
+          }
 
           case 'GET_PAGE_TEXT':
             sendResponse({ ok: true, result: extractStructuredMarkdown(message.params || {}) });

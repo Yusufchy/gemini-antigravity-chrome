@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * Antigravity Chrome MCP Server v2.1.0 (stdio transport, JSON-RPC 2.0).
- * Exposes all 34 autonomous browser & DevTools tools to Google Antigravity and Gemini CLI.
+ * Antigravity Chrome MCP Server v2.2.0 (stdio transport, JSON-RPC 2.0).
+ * Exposes all 42 autonomous browser, local download/project-sync, hyper-speed deep-read/batch,
+ * and cooperative multi-agent DAG swarm tools to Google Antigravity and Gemini CLI.
  *
  * IMPORTANT: stdout is reserved strictly for MCP JSON-RPC protocol messages.
  */
@@ -15,7 +16,7 @@ const { BridgeLink } = require('./lib/bridge-link');
 const { TOOLS, normalizeParams } = require('./lib/tools');
 const { detectAntigravity } = require('./lib/detect-antigravity');
 
-const SERVER_INFO = { name: 'antigravity-chrome', version: '2.1.0' };
+const SERVER_INFO = { name: 'antigravity-chrome', version: '2.2.0' };
 const SUPPORTED_PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const log = (...args) => process.stderr.write(`[agy-chrome-mcp] ${args.join(' ')}\n`);
 
@@ -64,7 +65,7 @@ function prepareToolParams(name, rawArgs = {}) {
       }
       args.files = fileList;
       const stat = fs.statSync(fileList[0]);
-      if (stat.size <= 8 * 1024 * 1024) {
+      if (stat.size <= 16 * 1024 * 1024) {
         const ext = path.extname(fileList[0]).toLowerCase();
         args.base64 = fs.readFileSync(fileList[0]).toString('base64');
         args.fileName = path.basename(fileList[0]);
@@ -90,6 +91,16 @@ function formatToolResult(name, result, rawArgs = {}) {
     return { content };
   }
 
+  if (name === 'chrome_track_downloads' && result?._imageBase64) {
+    const { _imageBase64, ...meta } = result;
+    return {
+      content: [
+        { type: 'image', data: _imageBase64, mimeType: meta.mimeType || 'image/png' },
+        { type: 'text', text: JSON.stringify(meta, null, 2) }
+      ]
+    };
+  }
+
   if (name === 'chrome_inspect_element' && result?.screenshotBase64) {
     const { screenshotBase64, ...meta } = result;
     return {
@@ -102,7 +113,7 @@ function formatToolResult(name, result, rawArgs = {}) {
 
   if (name === 'chrome_gif_recorder' && result?.base64) {
     const { base64, dataUrl: _omit, ...meta } = result;
-    if (rawArgs.savePath) {
+    if (rawArgs.savePath && !meta.savedTo) {
       const outPath = path.resolve(String(rawArgs.savePath));
       fs.mkdirSync(path.dirname(outPath), { recursive: true });
       fs.writeFileSync(outPath, Buffer.from(base64, 'base64'));
@@ -120,12 +131,12 @@ function formatToolResult(name, result, rawArgs = {}) {
     const { base64, ...meta } = result;
     const buf = Buffer.from(base64, 'base64');
     meta.byteLength = buf.length;
-    if (rawArgs.savePath) {
+    if (rawArgs.savePath && !meta.savedTo) {
       const outPath = path.resolve(String(rawArgs.savePath));
       fs.mkdirSync(path.dirname(outPath), { recursive: true });
       fs.writeFileSync(outPath, buf);
       meta.savedTo = outPath;
-    } else {
+    } else if (!meta.savedTo) {
       meta.base64Preview = `${base64.slice(0, 120)}... (${buf.length} bytes)`;
     }
     return { content: [{ type: 'text', text: JSON.stringify(meta, null, 2) }] };
@@ -175,9 +186,11 @@ async function handleRequest(msg) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          "Controls the user's real, authenticated Chrome browser via Gemini Antigravity in Chrome v2.1.0 (34 tools). " +
-          'Workflow: chrome_open_url / chrome_read_page / chrome_get_page_text / chrome_find_elements -> act with refs -> verify. ' +
-          'Includes select_option (native + ARIA combobox), storage (HTTP-only cookies + localStorage), audit_page (Core Web Vitals + WCAG + SEO), emulate (dark mode/network/CPU/geo), save_pdf, extract_data, macro_recorder (Playwright codegen), watch_page, and gif_recorder.'
+          "Controls the user's real, authenticated Chrome browser via Gemini Antigravity in Chrome v2.2.0 (42 tools). " +
+          'Prefer chrome_deep_read (single-RPC full intelligence + delta diffing), chrome_batch_actions (multi-step in 1 round-trip), ' +
+          'chrome_download_file + chrome_track_downloads (atomic project-folder download delivery, SHA-256 tracking, and JSON/CSV/PDF/ZIP/image parsing), ' +
+          'chrome_agent_session + chrome_parallel_run (isolated multi-agent sessions with Per-Tab Fair RWLocks & parallel fan-out), ' +
+          'and chrome_swarm_plan + chrome_swarm_blackboard (cooperative multi-agent DAG planning with roles, responsibilities, critical-path scheduling & shared Blackboard).'
       });
       link.ensure().catch((err) => log('bridge warm-up failed:', err.message));
       return;
@@ -201,7 +214,8 @@ async function handleRequest(msg) {
       try {
         const rawArgs = params.arguments || {};
         const prepared = prepareToolParams(name, rawArgs);
-        const result = await link.call(name, prepared);
+        const callTimeout = Math.max(60000, Number(rawArgs.timeoutMs) || 60000);
+        const result = await link.call(name, prepared, callTimeout);
         reply(id, formatToolResult(name, result, rawArgs));
       } catch (err) {
         let hint = '';
@@ -244,4 +258,4 @@ rl.on('line', (line) => {
 rl.on('close', () => process.exit(0));
 process.on('uncaughtException', (err) => log('uncaught:', err.stack || err.message));
 process.on('unhandledRejection', (err) => log('unhandled rejection:', err?.stack || err));
-log('ready');
+log('ready (v2.2.0, 42 tools)');

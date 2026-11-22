@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Gemini Antigravity in Chrome",
   "short_name": "Antigravity",
-  "version": "2.1.0",
-  "description": "Autonomous browser control, DOM & Shadow DOM inspection, multi-tab synthesis, and live session bridge for Google Antigravity.",
+  "version": "2.2.0",
+  "description": "Fast multi-agent Chrome automation, local project download sync, deep page intelligence & DevTools bridge for Google Antigravity.",
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
@@ -37,7 +37,8 @@
     "contextMenus",
     "notifications",
     "nativeMessaging",
-    "offscreen"
+    "offscreen",
+    "downloads"
   ],
   "host_permissions": [
     "<all_urls>"

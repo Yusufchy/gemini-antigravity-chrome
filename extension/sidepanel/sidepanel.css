@@ -1097,6 +1097,24 @@ body {
   cursor: not-allowed;
 }
 
+/* WCAG 2.2 AA Focus Indicators & Minimum Target Sizes */
+:where(button, a, input, textarea, [tabindex="0"]):focus-visible {
+  outline: 2px solid var(--fg);
+  outline-offset: 2px;
+}
+
+.icon-btn,
+.tool-icon-btn,
+.mini-btn,
+.mode-chip,
+.seg-btn,
+.brand-btn,
+.ctx-chip,
+.text-btn {
+  min-block-size: 24px;
+  min-inline-size: 24px;
+}
+
 @supports not (scrollbar-color: auto) {
   .messages::-webkit-scrollbar,
   .drawer-body::-webkit-scrollbar {
